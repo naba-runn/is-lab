@@ -72,10 +72,51 @@ def playfair_encrypt(text, key):
     return result
 
 
-text = "The key is hidden under the door pad"
+def playfair_decrypt(cipher, key):
+    matrix = create_matrix(key)
 
-print("Matrix:")
-for row in create_matrix("GUIDANCE"):
-    print(row)
+    position = {
+        matrix[r][c]: (r, c)
+        for r in range(5)
+        for c in range(5)
+    }
 
-print("Cipher:", playfair_encrypt(text, "GUIDANCE"))
+    cipher = ''.join(c for c in cipher.lower() if c.isalpha())
+
+    result = ""
+
+    for i in range(0, len(cipher), 2):
+        a, b = cipher[i], cipher[i + 1]
+
+        r1, c1 = position[a]
+        r2, c2 = position[b]
+
+        # Same row
+        if r1 == r2:
+            result += matrix[r1][(c1 - 1) % 5]
+            result += matrix[r2][(c2 - 1) % 5]
+
+        # Same column
+        elif c1 == c2:
+            result += matrix[(r1 - 1) % 5][c1]
+            result += matrix[(r2 - 1) % 5][c2]
+
+        # Rectangle
+        else:
+            result += matrix[r1][c2]
+            result += matrix[r2][c1]
+
+    return result
+
+
+if __name__ == "__main__":
+    text = "The key is hidden under the door pad"
+    key = "GUIDANCE"
+
+    print("Matrix:")
+    for row in create_matrix(key):
+        print(row)
+
+    cipher = playfair_encrypt(text, key)
+    print("Cipher :", cipher)
+    print("Plain  :", playfair_decrypt(cipher, key))
