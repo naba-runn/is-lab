@@ -9,6 +9,9 @@ def aes128_generate_key():
 
 
 def aes128_encrypt(key_hex, plaintext):
+    # bytes.fromhex() decodes the hex digits into 16 raw bytes.
+    # key_hex.encode() would instead treat the 32-character string as literal
+    # ASCII text -> 32 bytes -> silently becomes AES-256, not AES-128.
     key = bytes.fromhex(key_hex)
 
     iv = get_random_bytes(AES.block_size)

@@ -54,6 +54,30 @@ def rabin_decrypt(n, p, q, ciphertext, alphabet_size=256):
     return plaintext
 
 
+# ---- from ciphers/aes.py (verbatim) ----
+
+def aes_encrypt(key, plaintext, iv=None):
+    key_bytes = key.encode() if isinstance(key, str) else key
+    iv = iv or get_random_bytes(AES.block_size)
+
+    cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+    encrypted = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
+
+    return (iv + encrypted).hex()
+
+
+def aes_decrypt(key, ciphertext):
+    key_bytes = key.encode() if isinstance(key, str) else key
+
+    raw = bytes.fromhex(ciphertext)
+    iv, encrypted = raw[:AES.block_size], raw[AES.block_size:]
+
+    cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+    decrypted = unpad(cipher.decrypt(encrypted), AES.block_size)
+
+    return decrypted.decode()
+
+
 # ---------- Centralized Key Management Service ----------
 
 class RabinKeyManagementService:
@@ -76,15 +100,10 @@ class RabinKeyManagementService:
         never kept in the clear -- satisfies the 'not accessible to
         unauthorized parties' requirement (and HIPAA's encryption-at-rest
         expectation for anything touching patient data)."""
-        raw = f"{p},{q}".encode()
-        iv = get_random_bytes(AES.block_size)
-        cipher = AES.new(self._master_key, AES.MODE_CBC, iv)
-        return iv + cipher.encrypt(pad(raw, AES.block_size))
+        return aes_encrypt(self._master_key, f"{p},{q}")
 
     def _unseal(self, sealed):
-        iv, encrypted = sealed[:AES.block_size], sealed[AES.block_size:]
-        cipher = AES.new(self._master_key, AES.MODE_CBC, iv)
-        p, q = unpad(cipher.decrypt(encrypted), AES.block_size).decode().split(",")
+        p, q = aes_decrypt(self._master_key, sealed).split(",")
         return int(p), int(q)
 
     def _require_active(self, facility):

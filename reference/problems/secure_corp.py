@@ -1,10 +1,90 @@
-import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from Crypto.Util.number import getPrime, getRandomRange
 from Crypto.Random import get_random_bytes
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric import rsa as rsa_lib, padding
 from cryptography.hazmat.primitives import hashes
+
+
+# ---- from ciphers/rsa.py (verbatim) ----
+
+def rsa_generate_keys():
+    private_key = rsa_lib.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+
+    numbers = private_key.private_numbers()
+
+    n = numbers.public_numbers.n
+    e = numbers.public_numbers.e
+    d = numbers.d
+
+    return private_key, public_key, n, e, d
+
+
+def rsa_encrypt(public_key, message):
+    ciphertext = public_key.encrypt(
+        message.encode(),
+        padding.OAEP(
+            mgf=padding.MGF1(hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+
+    return ciphertext.hex()
+
+
+def rsa_decrypt(private_key, ciphertext):
+    decrypted = private_key.decrypt(
+        bytes.fromhex(ciphertext),
+        padding.OAEP(
+            mgf=padding.MGF1(hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+
+    return decrypted.decode()
+
+
+# ---- from ciphers/dh.py (verbatim) ----
+
+def dh_generate_parameters(bits=256):
+    p = getPrime(bits)
+    g = 2
+
+    return p, g
+
+
+def dh_generate_keypair(p, g):
+    private_key = getRandomRange(2, p - 1)
+    public_key = pow(g, private_key, p)
+
+    return private_key, public_key
+
+
+# ---- from ciphers/aes.py (verbatim) ----
+
+def aes_encrypt(key, plaintext, iv=None):
+    key_bytes = key.encode() if isinstance(key, str) else key
+    iv = iv or get_random_bytes(AES.block_size)
+
+    cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+    encrypted = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
+
+    return (iv + encrypted).hex()
+
+
+def aes_decrypt(key, ciphertext):
+    key_bytes = key.encode() if isinstance(key, str) else key
+
+    raw = bytes.fromhex(ciphertext)
+    iv, encrypted = raw[:AES.block_size], raw[AES.block_size:]
+
+    cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+    decrypted = unpad(cipher.decrypt(encrypted), AES.block_size)
+
+    return decrypted.decode()
 
 
 # ---------- Key Management: generation, distribution, revocation ----------
@@ -19,18 +99,16 @@ class KeyManager:
     """
 
     def __init__(self, dh_bits=256):
-        self.dh_p = getPrime(dh_bits)
-        self.dh_g = 2
+        self.dh_p, self.dh_g = dh_generate_parameters(dh_bits)
         self.subsystems = {}   # name -> key material + active flag
 
     def register(self, name):
-        rsa_private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        dh_private = getRandomRange(2, self.dh_p - 1)
-        dh_public = pow(self.dh_g, dh_private, self.dh_p)
+        rsa_private, rsa_public, _, _, _ = rsa_generate_keys()
+        dh_private, dh_public = dh_generate_keypair(self.dh_p, self.dh_g)
 
         self.subsystems[name] = {
             "rsa_private": rsa_private,
-            "rsa_public": rsa_private.public_key(),
+            "rsa_public": rsa_public,
             "dh_private": dh_private,
             "dh_public": dh_public,
             "active": True,
@@ -63,30 +141,19 @@ def establish_session_key(manager, name_a, name_b):
     a = manager._require_active(name_a)
     b = manager._require_active(name_b)
 
-    encrypted_for_b = b["rsa_public"].encrypt(
-        str(a["dh_public"]).encode(),
-        padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-    )
-    dh_public_a = int(b["rsa_private"].decrypt(
-        encrypted_for_b,
-        padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
-    ).decode())
+    encrypted_for_b = rsa_encrypt(b["rsa_public"], str(a["dh_public"]))
+    dh_public_a = int(rsa_decrypt(b["rsa_private"], encrypted_for_b))
 
     shared_secret = pow(dh_public_a, b["dh_private"], manager.dh_p)
     return derive_aes_key(shared_secret)
 
 
 def send_document(session_key, plaintext):
-    iv = get_random_bytes(AES.block_size)
-    cipher = AES.new(session_key, AES.MODE_CBC, iv)
-    return (iv + cipher.encrypt(pad(plaintext.encode(), AES.block_size))).hex()
+    return aes_encrypt(session_key, plaintext)
 
 
 def receive_document(session_key, ciphertext):
-    raw = bytes.fromhex(ciphertext)
-    iv, encrypted = raw[:AES.block_size], raw[AES.block_size:]
-    cipher = AES.new(session_key, AES.MODE_CBC, iv)
-    return unpad(cipher.decrypt(encrypted), AES.block_size).decode()
+    return aes_decrypt(session_key, ciphertext)
 
 
 if __name__ == "__main__":
