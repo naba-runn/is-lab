@@ -18,8 +18,10 @@
 #   DES                                                ciphers/des.py
 #   Triple DES                                         ciphers/tripledes.py
 #   AES, any key length (text key, optional given iv)  ciphers/aes.py
-#   AES-128 with a given HEX key                       ciphers/aes128.py
-#   AES-192 showing every round step                   ciphers/aes192_steps.py
+#   AES-128 with a given HEX key (32 hex chars)         ciphers/aes128.py
+#   AES-192 with a given HEX key (48 hex chars)         ciphers/aes192.py
+#   AES-256 with a given HEX key (64 hex chars)         ciphers/aes256.py
+#   AES-192 showing every round step                    ciphers/aes192_steps.py
 #   AES or DES in ECB / CBC / CFB / OFB / CTR          ciphers/block_modes.py
 #   RSA, generate real keys                            ciphers/rsa.py
 #   RSA, given raw n / e / d numbers                   ciphers/rsa_given_keys.py

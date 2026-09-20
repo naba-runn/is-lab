@@ -1,0 +1,3 @@
+Name: Nabarun | Age: 21 | Gender: Male | Diagnosis: SLE
+Name: Tanisha | Age: 20 | Gender: Female | Diagnosis: Autism
+Name: Gae | Age: 19 | Gender: MF | Diagnosis: Gae
