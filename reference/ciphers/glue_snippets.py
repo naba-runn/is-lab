@@ -2,7 +2,7 @@
 # the actual ciphers -- key/IV normalization, timestamps, and tamper
 # simulation. None of this is "a cipher" (it's ordinary Python), but it's
 # copy-paste ready exactly like the algorithm files are, so it lives here
-# instead of only inside the CHEATSHEET.
+# instead of only in the notes under guide/
 
 from datetime import datetime
 

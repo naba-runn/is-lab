@@ -192,21 +192,80 @@ def doctor_menu(public_key, private_key, e, n, d):
 
 
 # ---------- Nurse / Admin roles ----------
-# Only the Doctor's requirements were specified for this question. Add
-# Nurse's and Admin's own menu functions here following the exact same
-# shape as doctor_menu() above once their requirements are known -- e.g. a
-# Nurse might get read-only access to metadata (like MediSecure's Auditor:
-# view hash/timestamp, verify the signature, but never call rsa_decrypt),
-# and an Admin might get user/key management (like secure_corp.py's
-# KeyManager: register/revoke).
 
-def nurse_menu():
+def nurse_menu(public_key, n, e):
     print("Nurse role not yet specified for this question.")
+    while True:
+        print("\n--- Nurse Menu ---")
+        print("1. View previously stored records")
+        print("2. Verify a record")
+        print("3. Back")
+        choice = input("Choice: ").strip()
+        
+        if choice == "1":
+            records = read_records_from_file(PATIENTS_FILE)
+            if not records:
+                print("No records stored yet.")
+            for i, r in enumerate(records):
+                print(f"[{i}] hash={r['hash'][:16]}... | stored={r['timestamp']}")
 
+        elif choice == "2":
+            records = read_records_from_file(PATIENTS_FILE)
+            if not records:
+                print("No records stored yet.")
+                continue
 
-def admin_menu():
+            for i, r in enumerate(records):
+                print(f"[{i}] encrypted={r["encrypted"]} | hash={r['hash'][:16]}... | digital signature = {r["signature"]} | stored={r['timestamp']}")
+
+            try:
+                index = int(input("Record number to decrypt: ").strip())
+                record = records[index]
+            except (ValueError, IndexError):
+                print("No such record.")
+                continue
+
+            integrity_ok = sha256_hash(record["encrypted"]) == record["hash"]
+            authenticity_ok = rsa_verify(record["signature"], e, n) == record["hash"]
+            
+            print(f"Integrity check   : {'PASSED' if integrity_ok else 'FAILED'}")
+            print(f"Authenticity check: {'PASSED' if authenticity_ok else 'FAILED'}")
+            print(f"Stored={r['timestamp']}")
+        elif choice==3:
+            break
+
+def admin_menu(public_key, e, n):
     print("Admin role not yet specified for this question.")
-
+    while True:
+            print("\n--- Admin's Menu ---")
+            print("1. View previously stored records")
+            print("2. Verify a record")
+            print("3. Back")
+            choice = input("Choice: ").strip()
+            
+            if choice == "1":
+                records = read_records_from_file(PATIENTS_FILE)
+                if not records:
+                    print("No records stored yet.")
+                for i, r in enumerate(records):
+                    print(f"[{i}] encrypted={r["encrypted"]} | hash={r['hash'][:16]}... | stored={r['timestamp']}")
+            elif choice =="2":
+                records = read_records_from_file(PATIENTS_FILE)
+                if not records:
+                    print("No records stored yet.")
+                    continue
+                try:
+                    index = int(input("Record number to decrypt: ").strip())
+                    record = records[index]
+                except (ValueError, IndexError):
+                    print("No such record.")
+                    continue
+    
+                authenticity_ok = rsa_verify(record["signature"], e, n) == record["hash"]
+                
+    
+                print(f"Authenticity check: {'PASSED' if authenticity_ok else 'FAILED'}")
+                print(f"Stored={r['timestamp']}")
 
 def main():
     print("Generating Doctor's RSA keypair (2048-bit)...")
@@ -230,9 +289,9 @@ def main():
         if choice == "1":
             doctor_menu(public_key, private_key, e, n, d)
         elif choice == "2":
-            nurse_menu()
+            nurse_menu(public_key, e, n)
         elif choice == "3":
-            admin_menu()
+            admin_menu(public_key, e, n)
         elif choice == "4":
             break
         else:
