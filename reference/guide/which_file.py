@@ -36,6 +36,7 @@
 #   Custom hash (5381, *33, 32-bit mask)               ciphers/hash_function.py
 #   MD5 / SHA-1 / SHA-256                              ciphers/hashing.py
 #   timestamp / normalize key / tamper                 ciphers/glue_snippets.py
+#   str/bytes/hex/int/bits conversions                 ciphers/type_conversions.py
 #
 # --- system_parts/ -----------------------------------------------------------
 #   Encrypt + hash + sign; check WITHOUT decrypting    system_parts/integrity_and_signature.py
