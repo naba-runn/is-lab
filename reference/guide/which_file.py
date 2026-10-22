@@ -33,6 +33,10 @@
 #   DSA (signature scheme built on DH parameters)      ciphers/dh_signature.py
 #   ECC / ECIES encryption                             ciphers/ecc.py
 #   Rabin                                              ciphers/rabin.py
+#   Paillier (ADD encrypted numbers)                   ciphers/paillier.py
+#   RSA multiplicative homomorphism (7 x 3)            ciphers/rsa_homomorphic.py
+#   Searchable encryption, symmetric (AES + HMAC)      ciphers/sse.py
+#   Searchable encryption, public-key (Paillier)       ciphers/pkse.py
 #   Custom hash (5381, *33, 32-bit mask)               ciphers/hash_function.py
 #   MD5 / SHA-1 / SHA-256                              ciphers/hashing.py
 #   timestamp / normalize key / tamper                 ciphers/glue_snippets.py
@@ -66,6 +70,7 @@
 #   Role-based system (Patient/Doctor/Auditor)         problems/medisecure.py
 #   AES+RSA+ElGamal+hash file system, tamper demo      problems/hospital_management.py
 #   Chained Vigenere -> AES -> RSA                     problems/prac1.py
+#   Encrypted blood-pressure diagnosis (> 130)         problems/secure_diagnosis.py
 #
 #
 # =============================================================================
@@ -84,3 +89,10 @@
 #   Diffie-Hellman, given p,g  -> skip dh_generate_parameters(); call
 #                                 dh_generate_keypair(p, g) once per side.
 #   AES key given as HEX       -> ciphers/aes128.py (or bytes.fromhex(key))
+#   Homomorphic: ADD encrypted numbers    -> ciphers/paillier.py
+#   Homomorphic: MULTIPLY encrypted ones  -> ciphers/rsa_homomorphic.py (NOT rsa.py:
+#                                            its OAEP padding breaks the property)
+#   Compare encrypted numbers (> / <)     -> Paillier subtract + blind, see
+#                                            problems/secure_diagnosis.py
+#   "Search encrypted data"               -> ciphers/sse.py (shared key) or
+#                                            ciphers/pkse.py (public key)

@@ -182,3 +182,31 @@
 #                                                                  helper
 #     Use .hex(), never .decode(), to turn corrupted/tampered bytes into a
 #     string for hashing, printing, or storing in a text file.
+#
+#  HOMOMORPHIC ENCRYPTION (lab 7)
+#   - Paillier adds, textbook RSA multiplies -- neither does both. Enc(a)*Enc(b)
+#     is the SUM under Paillier but the PRODUCT under textbook RSA, and adding
+#     two RSA ciphertexts gives garbage.
+#   - The ciphertexts are NOT hex strings, they are big ints. Through a text
+#     file they come back as strings, so int(...) them (ciphers/paillier.py).
+#   - RSA's multiplicative property exists only for UNPADDED (textbook) RSA.
+#     ciphers/rsa.py uses OAEP, which deliberately destroys it -- use
+#     ciphers/rsa_homomorphic.py for "multiply encrypted numbers".
+#   - Keep every plaintext AND the result below the modulus n or the value wraps
+#     around and decrypts to the wrong number.
+#   - A negative Paillier result decrypts as n - |value|, a huge positive number.
+#     Treat anything above n // 2 as negative (problems/secure_diagnosis.py).
+#   - Comparing encrypted numbers (> / <): ElGamal only multiplies, so the manual's
+#     ElGamal "comparison" is not a real one. With Paillier: subtract, blind with a
+#     random multiplier, decrypt only the sign.
+#
+#  SEARCHABLE ENCRYPTION (lab 8)
+#   - Randomized encryption cannot be used as a lookup key. AES-CBC with a random
+#     IV, RSA-OAEP and Paillier give a different ciphertext every time, so a
+#     dictionary keyed by Enc(word) never matches the query (this is why the
+#     manual's sample code finds nothing). SSE uses a deterministic keyed token
+#     (HMAC); PKSE tests equality homomorphically (ciphers/pkse.py).
+#   - Hashing the word is not enough on its own: anyone can hash a guess and look
+#     it up. The token must depend on a SECRET key (HMAC), never a bare SHA-256.
+#   - Lowercase and strip punctuation before indexing AND before querying, or
+#     "Patient," and "patient" become different words.
