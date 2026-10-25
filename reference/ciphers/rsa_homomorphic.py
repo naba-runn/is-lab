@@ -40,6 +40,16 @@ def rsa_he_multiply(n, c1, c2):
     return (c1 * c2) % n
 
 
+def rsa_he_multiply_plain(n, e, ciphertext, k):
+    """Enc(m) * k^e = Enc(k * m)."""
+    return (ciphertext * pow(k, e, n)) % n
+
+
+def rsa_he_power(n, ciphertext, k):
+    """Enc(m)^k = (m^e)^k = Enc(m^k)."""
+    return pow(ciphertext, k, n)
+
+
 if __name__ == "__main__":
     n, e, d = rsa_he_generate_keys()
     print("Public key  (n, e): n has", n.bit_length(), "bits, e =", e)
@@ -56,6 +66,9 @@ if __name__ == "__main__":
     decrypted_product = rsa_he_decrypt(n, d, ciphertext_product)
     print("Decrypted product        :", decrypted_product)
     print("matches", a, "*", b, "=", a * b, ":", decrypted_product == a * b)
+
+    print("Enc(7) * 5^e ->", rsa_he_decrypt(n, d, rsa_he_multiply_plain(n, e, ciphertext_a, 5)))
+    print("Enc(7) ^ 5   ->", rsa_he_decrypt(n, d, rsa_he_power(n, ciphertext_a, 5)))
 
     # RSA cannot ADD ciphertexts: Enc(a) + Enc(b) does not decrypt to a + b.
     decrypted_wrong_sum = rsa_he_decrypt(n, d, (ciphertext_a + ciphertext_b) % n)

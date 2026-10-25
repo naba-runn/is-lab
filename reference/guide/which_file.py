@@ -8,6 +8,10 @@
 #  files/         plain-text and JSON file read / write
 #  problems/      finished example systems (each file is standalone)
 #  guide/         these notes
+#  generate.py    asks about the scenario, writes a full runnable solution
+#                 file + runs its self-test (python generate.py --list for the
+#                 sample questions: evoting, employee, securevault,
+#                 healthsecure, hospital, medisecure, grant, fieldtrack)
 #
 # --- ciphers/ ----------------------------------------------------------------
 #   Additive / multiplicative / affine cipher          ciphers/primitives.py
@@ -34,11 +38,14 @@
 #   ECC / ECIES encryption                             ciphers/ecc.py
 #   Rabin                                              ciphers/rabin.py
 #   Paillier (ADD encrypted numbers)                   ciphers/paillier.py
-#   RSA multiplicative homomorphism (7 x 3)            ciphers/rsa_homomorphic.py
+#   Threshold Paillier (trustees decrypt the total)    ciphers/threshold_paillier.py
+#   RSA multiplicative homomorphism (7 x 3, x k, ^k)   ciphers/rsa_homomorphic.py
+#   ElGamal homomorphic (multiply, x k, ^k; and SUM    ciphers/elgamal_homomorphic.py
+#     with exponential ElGamal g^m)
 #   Searchable encryption, symmetric (AES + HMAC)      ciphers/sse.py
 #   Searchable encryption, public-key (Paillier)       ciphers/pkse.py
 #   Custom hash (5381, *33, 32-bit mask)               ciphers/hash_function.py
-#   MD5 / SHA-1 / SHA-256                              ciphers/hashing.py
+#   MD5 / SHA-1 / SHA-256 / SHA-512                    ciphers/hashing.py
 #   timestamp / normalize key / tamper                 ciphers/glue_snippets.py
 #   str/bytes/hex/int/bits conversions                 ciphers/type_conversions.py
 #
@@ -71,6 +78,8 @@
 #   AES+RSA+ElGamal+hash file system, tamper demo      problems/hospital_management.py
 #   Chained Vigenere -> AES -> RSA                     problems/prac1.py
 #   Encrypted blood-pressure diagnosis (> 130)         problems/secure_diagnosis.py
+#   ANY role portal: AES+Paillier+hash+RSA sig, saved  problems/portal_template.py
+#     keys, search, hexdump, homomorphic total         (START HERE for new scenarios)
 #
 #
 # =============================================================================

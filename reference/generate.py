@@ -1,0 +1,2511 @@
+# Exam solution GENERATOR -- answers a few questions about the scenario and
+# writes ONE standalone .py file you can run, show and edit.
+#
+#   python generate.py                         ask questions, write, self-test
+#   python generate.py --preset evoting        build a sample question directly
+#   python generate.py --list                  list the presets
+#   python generate.py --preset hospital --out hosp.py --no-test
+#
+# No AI involved: every cipher function in the output is copied VERBATIM from
+# ciphers/ (read with ast), and the rest comes from fixed templates. So the
+# output has exactly the functions and conventions of the rest of this repo.
+#
+# The generated file:
+#   - generates keys ONCE at start-up, never inside the menu loop
+#   - stores one record per line in a .txt file next to the script
+#   - verifies (hash + signature [+ time window]) BEFORE it decrypts
+#   - has a "(demo) tamper" option to show that verification catches changes
+#   - SHOW_STEPS (you answer it here): prints every value it computes -- keys, IV,
+#     ciphertexts, data hashed, hash, signature, recomputed hash, Paillier /
+#     RSA ciphertexts, running encrypted totals, trustee partials, tokens
+#   - search: plain index (in clear) or SSE / PKSE; shows the COMPLETE record
+#   - homomorphic SUM / AVERAGE / PRODUCT / vote count, each its own menu
+#     action, over all records, chosen IDs, or a field filter via an index
+#   - runs every menu action by itself with:   python <file> test
+#   - marks the numbers/names you should copy from the question with  TODO
+#
+# Two kinds of question are covered:
+#   1. record systems   encrypt + hash + sign + store, then verify / decrypt /
+#                       report / homomorphic tally / encrypted search per role
+#                       (MediSecure, SecureVault, HealthSecure, Hospital,
+#                       e-voting, grant portal, ...)
+#   2. key exchange     Diffie-Hellman shared secret -> classical cipher on
+#                       A-Z text with key validation (FieldTrack)
+# A single algorithm on its own ("encrypt with Playfair", "Paillier add") is
+# just the matching file in ciphers/ -- see guide/which_file.py.
+
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CIPHERS = os.path.join(HERE, "ciphers")
+
+
+# =============================================================================
+#  code assembly
+# =============================================================================
+
+def block(text):
+    return textwrap.dedent(text).strip("\n")
+
+
+def fill(text, **values):
+    text = block(text)
+    for name, value in values.items():
+        text = text.replace("{{" + name + "}}", str(value))
+    return text
+
+
+def q(text):
+    """A Python string literal in double quotes."""
+    return json.dumps(text, ensure_ascii=False)
+
+
+class Program:
+    """Collects imports + code blocks and renders one standalone file."""
+
+    def __init__(self):
+        self.plain_imports = set()
+        self.from_imports = {}
+        self.blocks = []
+        self.pulled = set()
+
+    def need(self, line):
+        if line.startswith("import "):
+            for name in line[len("import "):].split(","):
+                self.plain_imports.add(name.strip())
+        else:
+            module, names = re.match(r"from (\S+) import (.+)", line).groups()
+            self.from_imports.setdefault(module, set()).update(n.strip() for n in names.split(","))
+
+    def add(self, text, *imports):
+        for line in imports:
+            self.need(line)
+        self.blocks.append(text)
+
+    def use(self, filename, *names, patch=None):
+        """Copy the named top-level functions / constants from ciphers/<filename>."""
+        path = os.path.join(CIPHERS, filename)
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source)
+
+        found = {}
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in names:
+                found[node.name] = ast.get_source_segment(source, node)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in names:
+                        found[target.id] = ast.get_source_segment(source, node)
+        missing = [n for n in names if n not in found]
+        if missing:
+            sys.exit("generate.py: %s not found in ciphers/%s" % (", ".join(missing), filename))
+
+        new = [n for n in names if n not in self.pulled]
+        if not new:
+            return
+        self.pulled.update(new)
+        text = "\n\n\n".join(found[n] for n in new)
+        if patch:
+            text = text.replace(patch[0], patch[1])
+
+        # only the imports the copied code actually uses
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if re.search(r"\b%s\b" % re.escape(alias.name.split(".")[0]), text):
+                        self.plain_imports.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if re.search(r"\b%s\b" % re.escape(alias.asname or alias.name), text):
+                        self.from_imports.setdefault(node.module, set()).add(alias.name)
+
+        self.blocks.append("# ---------- from ciphers/%s (verbatim) ----------\n\n%s" % (filename, text))
+
+    def render(self, header):
+        lines = [header, ""]
+        lines += ["import " + name for name in sorted(self.plain_imports)]
+        for module in sorted(self.from_imports, key=lambda m: (not m.startswith("datetime"), m)):
+            lines.append("from %s import %s" % (module, ", ".join(sorted(self.from_imports[module]))))
+        return "\n".join(lines) + "\n\n\n" + "\n\n\n".join(self.blocks) + "\n"
+
+
+RESERVED = {"id", "hash", "time", "type", "input", "print", "file", "sum", "key", "rec",
+            "plaintext", "rec_id", "records", "len", "str", "int", "list", "open", "format",
+            "max", "min", "iv", "sig", "result", "status", "label", "short", "fields"}
+
+
+def to_var(label):
+    var = re.sub(r"\W+", "_", label.strip().lower()).strip("_") or "value"
+    if var[0].isdigit():
+        var = "f_" + var
+    return var + "_value" if var in RESERVED else var
+
+
+def parse_fields(spec):
+    """'Name, Age:int, Report:file' -> [{'label','var','kind'}]"""
+    fields = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        label, _, kind = part.partition(":")
+        kind = kind.strip().lower() or "text"
+        if kind not in ("text", "int", "file"):
+            kind = "text"
+        fields.append({"label": label.strip(), "var": to_var(label), "kind": kind})
+    return fields
+
+
+# =============================================================================
+#  1. record systems
+# =============================================================================
+
+SYMMETRIC = {"aes128": ("AES-128-CBC", 16), "aes192": ("AES-192-CBC", 24), "aes256": ("AES-256-CBC", 32),
+             "des": ("DES-CBC", 8), "3des": ("Triple DES", 24)}
+ASYMMETRIC = {"rsa": "RSA (OAEP)", "elgamal": "ElGamal", "ecc": "ECC (ECIES)", "rabin": "Rabin"}
+HASHES = {"sha256": "SHA-256", "sha512": "SHA-512", "sha1": "SHA-1", "md5": "MD5"}
+SIGNATURES = {"none": "no signature", "rsa": "RSA signature", "elgamal": "ElGamal signature",
+              "schnorr": "Schnorr signature", "dsa": "DSA signature"}
+
+BASE_ACTIONS = ["add", "view", "view_meta", "verify", "decrypt", "report", "search", "search_time"]
+# Every homomorphic operation the four lab-7 schemes support. scheme: p = Paillier,
+# m = textbook RSA, e = ElGamal (multiplicative), x = exponential ElGamal.
+# shape: agg = combine the chosen records into ONE result; map = a result per
+# record; pair = two records; votes = per-option counts.
+#   NOT possible: Paillier ciphertext*ciphertext, RSA addition, ElGamal addition
+#   (except the exponential variant), exponential-ElGamal multiplication.
+OPS = {
+    "sum":               ("p", "agg",   "Homomorphic SUM of %s (Paillier)"),
+    "average":           ("p", "agg",   "Homomorphic AVERAGE of %s (Paillier sum / count)"),
+    "scaled_sum":        ("p", "agg",   "Homomorphic SUM of %s x constant k (Paillier Enc(sum)^k)"),
+    "add_const":         ("p", "map",   "Add constant k to each %s (Paillier Enc(m) * g^k)"),
+    "scale_each":        ("p", "map",   "Multiply each %s by constant k (Paillier Enc(m)^k)"),
+    "difference":        ("p", "pair",  "DIFFERENCE of %s between two records (Paillier Enc(a) / Enc(b))"),
+    "compare":           ("p", "map",   "Is %s above a threshold? (Paillier subtract + blind, value hidden)"),
+    "votes":             ("p", "votes", "Tally votes for %s (Paillier one-hot)"),
+    "product":           ("m", "agg",   "Homomorphic PRODUCT of %s (textbook RSA)"),
+    "scaled_product":    ("m", "agg",   "Homomorphic PRODUCT of %s x constant k (RSA Enc(P) * k^e)"),
+    "rsa_scale_each":    ("m", "map",   "Multiply each %s by constant k (RSA Enc(m) * k^e)"),
+    "rsa_power":         ("m", "map",   "Raise each %s to the power k (RSA Enc(m)^k)"),
+    "eg_product":        ("e", "agg",   "Homomorphic PRODUCT of %s (ElGamal)"),
+    "eg_scaled_product": ("e", "agg",   "Homomorphic PRODUCT of %s x constant k (ElGamal (c1, c2*k))"),
+    "eg_scale_each":     ("e", "map",   "Multiply each %s by constant k (ElGamal (c1, c2*k))"),
+    "eg_power":          ("e", "map",   "Raise each %s to the power k (ElGamal (c1^k, c2^k))"),
+    "eg_sum":            ("x", "agg",   "Homomorphic SUM of %s (exponential ElGamal g^m)"),
+}
+HE_TYPES = {name: re.sub(r"\s+", " ", (label % "a field").replace("of a field", "").replace("each a field", "each value")
+                        .replace("Is a field", "Is a value").replace("for a field", ""))
+            for name, (_, _, label) in OPS.items()}
+
+
+def action_labels(cfg):
+    noun = cfg["noun"]
+    labels = {
+        "add": "Add new " + noun,
+        "view": "View all stored " + noun + "s (encrypted)",
+        "view_meta": "View IDs, timestamps, hashes and VALID/INVALID",
+        "verify": "Verify all " + noun + "s (hash + signature)",
+        "decrypt": "Verify, then decrypt one " + noun,
+        "report": "Generate compliance report (no decryption)",
+        "search": "Search " + noun + "s (" + " / ".join(m if m != "plain" else "plain index" for m in cfg["methods"]) + ")",
+        "search_time": "Search by time range",
+    }
+    for op in cfg["he"]:
+        labels[op["action"]] = OPS[op["type"]][2] % op["label"] + {
+            "ask": "", "pair": "", "all": " -- all records", "ids": " -- chosen IDs",
+            "filter": " -- filter by " + op.get("filter_field", "")}[op["select"]]
+    labels.update(cfg.get("labels", {}))
+    return labels
+
+
+DEFAULTS = {
+    "name": "Secure Records System",
+    "out": "exam_solution.py",
+    "noun": "record",
+    "id_label": "Record ID",
+    "fields": "Name, Details",
+    "enc": "aes256",
+    "key_src": "random",          # random | typed_once | typed_each   ("wrap" = old name for wrap: record)
+    "wrap": "none",               # RSA-encrypt the AES/DES key: none | record (fresh key per record) | file
+    "iv_src": "random",           # random | typed
+    "rsa_bits": 2048,
+    "elgamal_given": None,        # [p, g, x] for ElGamal ENCRYPTION of the data
+    "hash": "sha256",
+    "hash_over": "ciphertext",    # ciphertext | plaintext
+    "sig": "rsa",
+    "extra": None,                # {"label": "Authorization code", "given": [p, g, x] or None}
+    "he": [],                     # [{"type": "sum"|"average"|"product"|"votes", "field": label, "choices": [...]}]
+    "trustees": 0,                # >1 -> threshold Paillier decryption
+    "search": None,               # {"types": ["sse", "pkse"], "fields": [labels], "time": bool}
+    "window": None,               # label, e.g. "voting period" -> timestamp must be inside it
+    "roles": [],                  # [[role name, [actions]], ...]   [] -> one menu with everything
+    "show_steps": True,           # print every value computed (keys, ciphertexts, hashes, signatures, totals)
+    "persist": True,              # save keys to <name>_keys.txt on the first run, reuse them on later runs
+    "decrypted_file": True,       # append every successful decryption to <name>_decrypted.txt
+    "access_log": True,           # write <name>_access_log.txt
+}
+
+
+def field_by_label(cfg, label):
+    for f in cfg["fields"]:
+        if f["label"].lower() == label.lower():
+            return f
+    sys.exit("generate.py: no data field called %r (fields: %s)" % (label, ", ".join(f["label"] for f in cfg["fields"])))
+
+
+def as_text(f):
+    return f["var"] if f["kind"] in ("text", "choice", "file") else "str(%s)" % f["var"]
+
+
+def normalize(cfg):
+    cfg = dict(DEFAULTS, **cfg)
+    cfg["fields"] = parse_fields(cfg["fields"]) if isinstance(cfg["fields"], str) else cfg["fields"]
+    if cfg["key_src"] == "wrap":
+        cfg["wrap"] = "record"
+    if cfg["enc"] not in SYMMETRIC:
+        cfg["wrap"] = "none"
+    if cfg["wrap"] == "record":
+        cfg["key_src"] = "wrap"                   # internal name: a fresh key per record
+    elif cfg["wrap"] == "file" and cfg["key_src"] == "typed_each":
+        cfg["key_src"] = "typed_once"
+    if cfg["enc"] not in SYMMETRIC:
+        cfg["key_src"], cfg["iv_src"] = "-", "-"
+    if cfg["enc"] == "3des":
+        cfg["iv_src"] = "random"
+    if cfg["hash_over"] == "plaintext" and cfg["key_src"] == "typed_each":
+        print("note: hash of the plaintext needs the key to verify -> key typed once at start instead")
+        cfg["key_src"] = "typed_once"
+
+    # homomorphic operations: one menu action each
+    ops = cfg["he"] or []
+    if isinstance(ops, dict):
+        ops = [ops]
+    for op in ops:
+        f = field_by_label(cfg, op["field"])
+        f["kind"] = "choice" if op["type"] == "votes" else "int"
+        op["var"], op["label"] = f["var"], f["label"]
+        op["action"] = op["type"] + "_" + f["var"]
+        op["scheme"], op["shape"] = OPS[op["type"]][:2]
+        op["store"] = "votes" if op["type"] == "votes" else op["scheme"] + "_" + f["var"]
+        # which records it works on: ask (menu at run time) | all | ids | filter
+        op["select"] = "pair" if op["type"] == "difference" else op.get("select", "ask")
+        if op["select"] == "filter":
+            op["filter_field"] = field_by_label(cfg, op["filter_field"])["label"]
+            op["filter_method"] = {"sse": "SSE", "pkse": "PKSE"}.get(op.get("filter_method", "plain").lower(), "plain")
+    if sum(op["type"] == "votes" for op in ops) > 1:
+        sys.exit("generate.py: only one 'votes' operation is supported")
+    cfg["he"] = ops
+    if not any(op["scheme"] == "p" for op in ops):
+        cfg["trustees"] = 0
+
+    # indexes: used by search AND by the "filter" option of homomorphic actions
+    search = cfg["search"]
+    if search:
+        if "type" in search:
+            search["types"] = [search.pop("type")]
+        search["types"] = [t for t in search["types"] if t in ("sse", "pkse")]
+        search.setdefault("time", False)
+        index = search["fields"]
+    elif ops:
+        index = [f["label"] for f in cfg["fields"] if f["kind"] in ("text", "choice")]
+    else:
+        index = []
+    index_types = list(search["types"]) if search else []
+    for op in ops:
+        if op["select"] == "filter":
+            if op["filter_field"] not in index:
+                index = list(index) + [op["filter_field"]]
+            if op["filter_method"] != "plain" and op["filter_method"].lower() not in index_types:
+                index_types.append(op["filter_method"].lower())
+    cfg["index_types"] = index_types
+    cfg["index_fields"] = [field_by_label(cfg, label)["label"] for label in index]
+    cfg["methods"] = (["plain"] if index else []) + [t.upper() for t in index_types]
+    cfg["time_methods"] = ["plain"] + (["SSE"] if "sse" in index_types else [])
+
+    # which actions exist, which roles get them
+    all_actions = BASE_ACTIONS + [op["action"] for op in ops]
+    if not search:
+        all_actions = [a for a in all_actions if a not in ("search", "search_time")]
+    elif not search["time"]:
+        all_actions.remove("search_time")
+
+    def expand(actions):
+        out = []
+        for a in actions:
+            for b in ([op["action"] for op in ops] if a == "tally" else [a]):
+                if b in all_actions and b not in out:
+                    out.append(b)
+        return out
+
+    if cfg["roles"]:
+        cfg["roles"] = [[name, expand(actions)] for name, actions in cfg["roles"]]
+    else:
+        cfg["roles"] = [[None, list(all_actions)]]
+    cfg["used"] = set(a for _, actions in cfg["roles"] for a in actions) | {"add"}
+    return cfg
+
+
+# ---------- homomorphic menu actions (one generated function per operation) ----------
+
+SCHEME_CODE = {
+    "p": dict(enc='paillier_encrypt(K["p_n"], K["p_g"], %s)', parse="int", mul='paillier_add(K["p_n"], total, c)',
+              how="multiply mod n^2 = add plaintexts", dec="decrypt_total(%s)", start=0),
+    "m": dict(enc='rsa_he_encrypt(K["he_n"], K["he_e"], %s)', parse="int", mul='rsa_he_multiply(K["he_n"], total, c)',
+              how="multiply mod n = multiply plaintexts", dec='rsa_he_decrypt(K["he_n"], K["he_d"], %s)', start=1),
+    "e": dict(enc='elgamal_he_encrypt(K["eg_p"], K["eg_g"], K["eg_h"], %s)', parse="eg_parse",
+              mul='elgamal_he_multiply(K["eg_p"], total, c)', how="(c1*c1', c2*c2') mod p = multiply plaintexts",
+              dec='elgamal_he_decrypt(K["eg_p"], K["eg_x"], %s)', start=1),
+    "x": dict(enc='elgamal_exp_encrypt(K["eg_p"], K["eg_g"], K["eg_h"], %s)', parse="eg_parse",
+              mul='elgamal_he_multiply(K["eg_p"], total, c)', how="g^a * g^b = g^(a+b): adds the exponents",
+              dec='elgamal_exp_decrypt(K["eg_p"], K["eg_g"], K["eg_x"], %s)', start=0),
+}
+AGG_TITLE = {"sum": "SUM", "average": "AVERAGE", "scaled_sum": "SUM x k", "product": "PRODUCT",
+             "scaled_product": "PRODUCT x k", "eg_product": "PRODUCT", "eg_scaled_product": "PRODUCT x k", "eg_sum": "SUM"}
+AGG_POST = {"scaled_sum": ('paillier_multiply_plain(K["p_n"], total, k)', "Enc(sum)^k mod n^2 = Enc(k * sum)"),
+            "scaled_product": ('rsa_he_multiply_plain(K["he_n"], K["he_e"], total, k)', "Enc(P) * k^e mod n = Enc(k * P)"),
+            "eg_scaled_product": ('elgamal_he_multiply_plain(K["eg_p"], total, k)', "(c1, c2 * k) mod p = Enc(k * P)")}
+MAP_SPEC = {"add_const": ('paillier_add_plain(K["p_n"], K["p_g"], c, k)', "Enc(m) * g^k mod n^2 = Enc(m + k)", "%s + k"),
+            "scale_each": ('paillier_multiply_plain(K["p_n"], c, k)', "Enc(m)^k mod n^2 = Enc(k * m)", "k * %s"),
+            "rsa_scale_each": ('rsa_he_multiply_plain(K["he_n"], K["he_e"], c, k)', "Enc(m) * k^e mod n = Enc(k * m)", "k * %s"),
+            "rsa_power": ('rsa_he_power(K["he_n"], c, k)', "Enc(m)^k mod n = Enc(m^k)", "%s ^ k"),
+            "eg_scale_each": ('elgamal_he_multiply_plain(K["eg_p"], c, k)', "(c1, c2 * k) mod p = Enc(k * m)", "k * %s"),
+            "eg_power": ('elgamal_he_power(K["eg_p"], c, k)', "(c1^k, c2^k) mod p = Enc(m^k)", "%s ^ k")}
+NEEDS_K = set(AGG_POST) | set(MAP_SPEC)
+
+
+def select_expr(op, purpose):
+    """The generated line that picks the records -- fixed by what you answered in generate.py."""
+    if op["select"] == "all":
+        return "select_all()"
+    if op["select"] == "ids":
+        return "select_by_ids()"
+    if op["select"] == "filter":
+        return "select_by_filter(%s, %s)" % (q(op["filter_method"]), q(op["filter_field"]))
+    return "choose_records(%s)" % q(purpose)
+
+
+def he_function(op):
+    kind, fn, label, store = op["type"], op["action"], op["label"], op["store"]
+    title = OPS[kind][2] % label
+    s = SCHEME_CODE[op["scheme"]]
+
+    if kind == "votes":
+        return fill(r'''
+            def {{fn}}():
+                """{{title}}: multiply the Enc(0/1) of every VALID ballot per option; decrypt only the totals."""
+                records = {{select}}
+                totals = [paillier_encrypt(K["p_n"], K["p_g"], 0) for _ in CHOICES]
+                counted = []
+                for rec in records:
+                    if not is_valid(rec):
+                        print(rec["id"], ": failed verification, NOT counted")
+                        continue
+                    for i, c in enumerate(rec["votes"].split(";")):
+                        step("Enc(0/1) for " + CHOICES[i] + " in " + rec["id"], c)
+                        totals[i] = paillier_add(K["p_n"], totals[i], int(c))
+                    counted.append(rec["id"])
+                print("Valid ballots counted:", counted)
+                results = {}
+                for choice, total in zip(CHOICES, totals):
+                    show_value(choice + " encrypted total", short(str(total), 60))
+                    results[choice] = decrypt_total(total)
+                result_line("RESULT: " + str(results))
+                log_access("{{fn}}", ",".join(counted), str(results))
+                return results
+        ''', fn=fn, title=title, select=select_expr(op, "vote count"))
+
+    if kind == "difference":
+        return fill(r'''
+            def {{fn}}():
+                """{{title}}: Enc(a) * Enc(b)^-1 mod n^2 = Enc(a - b)."""
+                first = find_record(ask_text("First ID (a): "))
+                second = find_record(ask_text("Second ID (b): "))
+                if first is None or second is None:
+                    print("Not found.")
+                    return None
+                for rec in (first, second):
+                    if not is_valid(rec):
+                        print(rec["id"], ": failed verification -- not used.")
+                        return None
+                ca, cb = int(first["{{store}}"]), int(second["{{store}}"])
+                step("Enc({{label}}) of " + first["id"] + " (a)", ca)
+                step("Enc({{label}}) of " + second["id"] + " (b)", cb)
+                difference = paillier_subtract(K["p_n"], ca, cb)
+                step("Enc(a) * Enc(b)^-1 mod n^2 = Enc(a - b)", difference)
+                result = decrypt_total(difference)
+                if result > K["p_n"] // 2:            # negative numbers decrypt as n - |value|
+                    result -= K["p_n"]
+                result_line("{{label}} of " + first["id"] + " - " + second["id"] + " = " + str(result))
+                log_access("{{fn}}", first["id"] + "," + second["id"], str(result))
+                return result
+        ''', fn=fn, title=title, label=label, store=store)
+
+    if kind == "compare":
+        return fill(r'''
+            def {{fn}}():
+                """{{title}}: Enc(m - T) blinded by a random r > 0; only the SIGN is learned, never m."""
+                records = {{select}}
+                threshold = ask_int("Threshold T: ")
+                results = {}
+                for rec in records:
+                    if not is_valid(rec):
+                        print(rec["id"], ": failed verification, NOT included")
+                        continue
+                    c = int(rec["{{store}}"])
+                    step("Enc({{label}}) of " + rec["id"], c)
+                    difference = paillier_add_plain(K["p_n"], K["p_g"], c, -threshold)
+                    step("Enc(m) * g^-T = Enc(m - T)", difference)
+                    blinded = paillier_multiply_plain(K["p_n"], difference, getRandomRange(1, 2 ** 32))
+                    step("Enc((m - T) * r), r random", blinded)
+                    value = decrypt_total(blinded)
+                    if value > K["p_n"] // 2:
+                        value -= K["p_n"]
+                    step("decrypted blinded value (only its sign means anything)", value)
+                    results[rec["id"]] = value > 0
+                    print("  " + rec["id"] + " : {{label}} " + ("ABOVE " if value > 0 else "NOT above ") + str(threshold))
+                log_access("{{fn}}", ",".join(results), str(results))
+                return results
+        ''', fn=fn, title=title, label=label, store=store, select=select_expr(op, "threshold check of " + label))
+
+    if op["shape"] == "map":
+        transform, how, expr = MAP_SPEC[kind]
+        return fill(r'''
+            def {{fn}}():
+                """{{title}}. Each new value is decrypted on its own."""
+                records = {{select}}
+                k = ask_int("Constant k: ")
+                results = {}
+                for rec in records:
+                    if not is_valid(rec):
+                        print(rec["id"], ": failed verification, NOT included")
+                        continue
+                    c = {{parse}}(rec["{{store}}"])
+                    step("Enc({{label}}) of " + rec["id"], c)
+                    new = {{transform}}
+                    step("{{how}}", new)
+                    results[rec["id"]] = {{dec}}
+                    print("  " + rec["id"] + " : {{expr}} = " + str(results[rec["id"]]) + "    (k = " + str(k) + ")")
+                log_access("{{fn}}", ",".join(results), str(results))
+                return results
+        ''', fn=fn, title=title, select=select_expr(op, title.split(" (")[0].lower()), parse=s["parse"], store=store, label=label,
+                    transform=transform, how=how, dec=s["dec"] % "new", expr=expr % label)
+
+    # agg: combine every chosen record into one encrypted result
+    word = "total" if s["start"] == 0 else "product"
+    lines = [
+        "def %s():" % fn,
+        '    """%s. Only the final result is decrypted."""' % title,
+        "    records = " + select_expr(op, AGG_TITLE[kind].lower() + " of " + label)]
+    if kind in NEEDS_K:
+        lines.append('    k = ask_int("Constant k: ")')
+    lines += [
+        "    total = " + s["enc"] % s["start"],
+        '    step("start with Enc(%d)", total)' % s["start"],
+        "    counted = []",
+        "    for rec in records:",
+        "        if not is_valid(rec):",
+        '            print(rec["id"], ": failed verification, NOT included")',
+        "            continue",
+        '        c = %s(rec["%s"])' % (s["parse"], store),
+        '        step("Enc(%s) of " + rec["id"], c)' % label,
+        "        total = " + s["mul"],
+        '        step("encrypted %s after " + rec["id"] + " (%s)", total)' % (word, s["how"]),
+        '        counted.append(rec["id"])',
+        "    if not counted:",
+        '        print("No valid records selected.")',
+        "        return None"]
+    if kind in AGG_POST:
+        lines += ["    total = " + AGG_POST[kind][0], '    step("%s", total)' % AGG_POST[kind][1]]
+    lines += ['    section("result")', '    show_value("encrypted result", short(str(total), 60))',
+              "    result = " + s["dec"] % "total"]
+    if op["scheme"] != "p":
+        lines.append('    step("decrypted with the private key", result)')
+    if kind == "average":
+        lines += ["    average = result / len(counted)",
+                  '    print("SUM =", result, " count =", len(counted))',
+                  "    result = average"]
+    lines += ['    result_line("%s of %s over " + ", ".join(counted) + " = " + str(result))' % (AGG_TITLE[kind], label),
+              '    log_access("%s", ",".join(counted), str(result))' % fn,
+              "    return result"]
+    return "\n".join(lines)
+
+
+def build_records(cfg):
+    cfg = normalize(cfg)
+    prog = Program()
+    enc, sym = cfg["enc"], cfg["enc"] in SYMMETRIC
+    wrap = cfg["key_src"] == "wrap"
+    wrap_file = cfg["wrap"] == "file"
+    persist = cfg["persist"]
+    need_rsa = enc == "rsa" or wrap or wrap_file or cfg["sig"] == "rsa"
+    ops = cfg["he"]
+    search = cfg["search"]
+    types = cfg["index_types"]
+    index_fields = cfg["index_fields"]
+    schemes = set(op["scheme"] for op in ops)
+    need_paillier = "p" in schemes or "pkse" in types
+    need_rsa_he = "m" in schemes
+    need_eg_he = "e" in schemes or "x" in schemes
+    prefix = to_var(os.path.splitext(os.path.basename(cfg["out"]))[0])
+    fields = cfg["fields"]
+    sig = cfg["sig"]
+
+    # ---------------- header ----------------
+    stored = ["id", "enc"]
+    if wrap:
+        stored.append("key")
+    if cfg["extra"]:
+        stored.append("extra")
+    for op in ops:
+        if op["store"] not in stored:
+            stored.append(op["store"])
+    stored += ["time", "hash"]
+    if sig != "none":
+        stored.append("sig")
+
+    enc_name = SYMMETRIC[enc][0] if sym else ASYMMETRIC[enc]
+    sym_name = enc_name.split("-CBC")[0]
+    desc = {"id": cfg["id_label"] + " (plain, used to look records up)",
+            "enc": enc_name + " of: " + ", ".join(f["label"] for f in fields),
+            "key": "the per-record " + sym_name + " key, RSA-%d encrypted" % cfg["rsa_bits"],
+            "extra": "ElGamal encryption of the " + (cfg["extra"]["label"] if cfg["extra"] else ""),
+            "votes": "Paillier encryptions of a 0/1 per option (one-hot ballot)",
+            "time": "timestamp YYYY-MM-DD HH:MM:SS",
+            "hash": HASHES[cfg["hash"]] + " of the " + ("plaintext" if cfg["hash_over"] == "plaintext" else "id + ciphertexts + time"),
+            "sig": SIGNATURES[sig] + " of hash|time"}
+    scheme_desc = {"p": "Paillier encryption of %s (adds)", "m": "textbook-RSA encryption of %s (multiplies)",
+                   "e": "ElGamal (c1,c2) of %s (multiplies)", "x": "exponential-ElGamal (c1,c2) of g^%s (adds)"}
+    for op in ops:
+        if op["type"] != "votes":
+            desc[op["store"]] = scheme_desc[op["scheme"]] % op["label"]
+    header = ["# %s  --  generated by reference/generate.py" % cfg["name"], "#",
+              "# One record per line in %s_records.txt:" % prefix]
+    header += ["#   %-10s %s" % (name, desc[name]) for name in stored]
+    header += ["#"]
+    for role, actions in cfg["roles"]:
+        header.append("# %-18s: %s" % (role or "Menu", ", ".join(actions)))
+    if index_fields:
+        header += ["#", "# Indexes on %s: %s" % (", ".join(index_fields), ", ".join(cfg["methods"]))]
+        header.append("#   (the plain index is stored in CLEAR -- it is the 'normal' index to compare with)")
+    header += ["#",
+               "# Verification ALWAYS happens before decryption."]
+    if persist:
+        header += ["# Keys are generated on the FIRST run and saved to %s_keys.txt; every later" % prefix,
+                   "# run loads them, so records from earlier runs still verify and decrypt.",
+                   "# Delete the keys file AND the records file to start completely fresh."]
+    else:
+        header += ["# Keys are generated at every start-up, so the data files are cleared at start",
+                   "# (old records could not be verified with new keys anyway)."]
+    if wrap_file:
+        header.append("# The %s key is RSA-encrypted and saved to %s_wrapped_key.txt; decryption reads"
+                      % (sym_name, prefix))
+        header.append("# it back and recovers the key with the RSA private key.")
+    if cfg["decrypted_file"] and "decrypt" in cfg["used"]:
+        header.append("# Every successful decryption is appended to %s_decrypted.txt (history)." % prefix)
+    header += ["# SHOW_STEPS = True prints every value computed (keys, ciphertexts, hashes, ...).",
+               "# Lines marked TODO hold names/numbers to copy from the question.",
+               "#",
+               "# Run:  python %s         (menu)" % os.path.basename(cfg["out"]),
+               "#       python %s test    (runs every action with typed-in answers)" % os.path.basename(cfg["out"])]
+
+    # ---------------- constants ----------------
+    index_files = []
+    consts = ['HERE = os.path.dirname(os.path.abspath(__file__))',
+              'RECORDS_FILE = os.path.join(HERE, "%s_records.txt")' % prefix,
+              'LOG_FILE = os.path.join(HERE, "%s_access_log.txt")' % prefix]
+    if persist:
+        consts.append('KEYS_FILE = os.path.join(HERE, "%s_keys.txt")' % prefix)
+    if wrap_file:
+        consts.append('WRAPPED_KEY_FILE = os.path.join(HERE, "%s_wrapped_key.txt")' % prefix)
+    if cfg["decrypted_file"] and "decrypt" in cfg["used"]:
+        consts.append('DECRYPTED_FILE = os.path.join(HERE, "%s_decrypted.txt")' % prefix)
+    if "report" in cfg["used"]:
+        consts.append('REPORT_FILE = os.path.join(HERE, "%s_report.txt")' % prefix)
+    if index_fields:
+        index_files.append("PLAIN_INDEX_FILE")
+        consts.append('PLAIN_INDEX_FILE = os.path.join(HERE, "%s_plain_index.txt")' % prefix)
+    if "sse" in types:
+        index_files.append("SSE_INDEX_FILE")
+        consts.append('SSE_INDEX_FILE = os.path.join(HERE, "%s_sse_index.txt")' % prefix)
+    if "pkse" in types:
+        index_files.append("PKSE_INDEX_FILE")
+        consts.append('PKSE_INDEX_FILE = os.path.join(HERE, "%s_pkse_index.txt")' % prefix)
+    consts += ["",
+               "FIELDS = %s" % json.dumps(stored),
+               "ID_LABEL = %s" % q(cfg["id_label"])]
+    votes_op = [op for op in ops if op["type"] == "votes"]
+    if votes_op:
+        consts.append("CHOICES = %s      # TODO: the real candidates / options" % json.dumps(votes_op[0]["choices"]))
+    if cfg["trustees"]:
+        consts.append("TRUSTEES = %d       # private key split between this many trustees (all needed)" % cfg["trustees"])
+    if index_fields:
+        consts.append("INDEX_FIELDS = %s" % json.dumps(index_fields))
+        consts.append("SEARCH_METHODS = %s" % json.dumps(cfg["methods"]))
+    if "search_time" in cfg["used"]:
+        consts.append("TIME_METHODS = %s" % json.dumps(cfg["time_methods"]))
+    consts += ['ROLE = "-"          # the role currently logged in (written to the access log)',
+               "SHOW_STEPS = %s   # chosen in generate.py: print every value computed" % bool(cfg["show_steps"])]
+    prog.add("\n".join(consts), "import os", "import sys")
+
+    # ---------------- verbatim cipher functions ----------------
+    prog.use("glue_snippets.py", "timestamp")
+    prog.need("from datetime import datetime, timedelta")
+    if (sym and cfg["key_src"] in ("typed_once", "typed_each")) or cfg["iv_src"] == "typed":
+        prog.use("glue_snippets.py", "normalize_bytes")
+    if sig == "elgamal":
+        prog.use("elgamal_signature.py", "_hash_to_int", "elgamal_generate_keys", "elgamal_sign", "elgamal_verify", "_egcd")
+    if sig == "schnorr":
+        prog.use("schnorr_signature.py", "_hash_to_int", "schnorr_generate_domain_parameters",
+                 "schnorr_generate_keys", "schnorr_sign", "schnorr_verify")
+    if sig == "dsa":
+        prog.use("dh_signature.py", "_hash_to_int", "dh_generate_domain_parameters", "dh_generate_keys", "dh_sign", "dh_verify")
+    if enc in ("aes128", "aes192", "aes256") or "sse" in types:
+        prog.use("aes.py", "aes_encrypt", "aes_decrypt")
+    if enc == "des":
+        prog.use("block_modes.py", "ALGORITHMS", "PADDED_MODES", "_to_bytes", "_new_cipher", "block_encrypt", "block_decrypt")
+    if enc == "3des":
+        prog.use("tripledes.py", "_split_key", "_ede_encrypt_block", "_ede_decrypt_block", "tripledes_encrypt", "tripledes_decrypt")
+    if need_rsa:
+        names = ["rsa_generate_keys"] + (["rsa_encrypt", "rsa_decrypt"] if enc == "rsa" or wrap or wrap_file else [])
+        patch = None
+        if cfg["rsa_bits"] != 2048:
+            patch = ("key_size=2048", "key_size=%d     # RSA-%d as the question asks" % (cfg["rsa_bits"], cfg["rsa_bits"]))
+        prog.use("rsa.py", *names, patch=patch)
+    if sig == "rsa":
+        prog.use("rsa_signature.py", "rsa_sign", "rsa_verify")
+    if enc == "elgamal" or cfg["extra"]:
+        names = ["elgamal_encrypt", "elgamal_decrypt"]
+        if (enc == "elgamal" and not cfg["elgamal_given"]) or (cfg["extra"] and not cfg["extra"].get("given")):
+            names.insert(0, "elgamal_generate_keys")
+        prog.use("elgamal.py", *names)
+    if enc == "ecc":
+        prog.use("ecc.py", "ecc_generate_keys", "derive_shared_key", "ecc_encrypt", "ecc_decrypt")
+    if enc == "rabin":
+        prog.use("rabin.py", "_prime_3_mod_4", "rabin_generate_keys", "rabin_encrypt", "rabin_decrypt")
+    prog.use("hashing.py", cfg["hash"] + "_hash")
+    if need_paillier:
+        names = ["paillier_generate_keys", "paillier_encrypt", "paillier_decrypt", "paillier_add"]
+        if "pkse" in types or "p" in schemes:
+            names += ["paillier_add_plain", "paillier_subtract", "paillier_multiply_plain"]
+        prog.use("paillier.py", *names)
+        if any(op["type"] == "compare" for op in ops):
+            prog.need("from Crypto.Util.number import getRandomRange")
+    if cfg["trustees"]:
+        prog.use("threshold_paillier.py", "threshold_split_key", "threshold_partial_decrypt", "threshold_combine")
+    if need_rsa_he:
+        prog.use("rsa_homomorphic.py", "rsa_he_generate_keys", "rsa_he_encrypt", "rsa_he_decrypt", "rsa_he_multiply",
+                 "rsa_he_multiply_plain", "rsa_he_power")
+    if need_eg_he:
+        prog.use("elgamal_homomorphic.py", "elgamal_he_generate_keys", "elgamal_he_encrypt", "elgamal_he_decrypt",
+                 "elgamal_he_multiply", "elgamal_he_multiply_plain", "elgamal_he_power",
+                 "elgamal_exp_encrypt", "elgamal_exp_decrypt")
+    if "sse" in types:
+        prog.use("sse.py", "sse_generate_key", "sse_trapdoor")
+    if "pkse" in types:
+        prog.use("pkse.py", "_word_number", "_text_to_number", "_number_to_text")
+        prog.need("from Crypto.Util.number import getRandomRange")
+
+    # ---------------- show every calculation ----------------
+    prog.add(block(r'''
+        # ---------- output formatting ----------
+
+        WRAP = 64          # long values (hex, big numbers) are printed in lines of this many characters
+
+
+        def wrap_value(value, indent):
+            """Cuts a long value into WRAP-character lines; every extra line starts at column `indent`."""
+            lines = []
+            for line in str(value).split("\n"):
+                lines += [line[i:i + WRAP] for i in range(0, len(line), WRAP)] or [""]
+            return ("\n" + " " * indent).join(lines)
+
+
+        def section(title):
+            print()
+            print("  " + title.upper())
+            print("  " + "-" * len(title))
+
+
+        def show_value(name, value, width=24):
+            """One aligned 'name : value' line; a long value wraps under itself."""
+            print("  " + name.ljust(width) + " : " + wrap_value(value, width + 5))
+
+
+        def step(name, value):
+            """One intermediate value (only when SHOW_STEPS is on): the name, the value indented below it."""
+            if SHOW_STEPS:
+                print("    > " + name)
+                print("        " + wrap_value(value, 8))
+                print()
+
+
+        def result_line(text):
+            print()
+            print("  ==> " + text)
+    '''))
+
+    # ---------------- keys ----------------
+    setup = ["# ---------- keys: generated ONCE at start-up ----------", "",
+             "K = {}", "", "", "def setup_keys():"]
+    if persist:
+        setup += ["    if os.path.exists(KEYS_FILE):",
+                  "        load_keys()",
+                  '        print("Keys loaded from", KEYS_FILE, "-- the same keys as the earlier runs.")',
+                  "        return"]
+    setup.append('    print("Generating keys (a few seconds)...")')
+    size = SYMMETRIC[enc][1] if sym else 0
+    if sym and cfg["key_src"] == "random":
+        setup.append('    K["sym"] = get_random_bytes(%d)' % size)
+        setup.append('    print("%s key (hex):", K["sym"].hex())' % sym_name)
+        prog.need("from Crypto.Random import get_random_bytes")
+    if sym and cfg["key_src"] == "typed_once":
+        setup.append('    K["sym"] = normalize_bytes(input("%s key (any text, fitted to %d bytes): "), %d)' % (sym_name, size, size))
+        setup.append('    print("%s key (hex):", K["sym"].hex())' % sym_name)
+    if wrap:
+        prog.need("from Crypto.Random import get_random_bytes")
+    if need_rsa:
+        setup.append('    K["rsa_priv"], K["rsa_pub"], K["rsa_n"], K["rsa_e"], K["rsa_d"] = rsa_generate_keys()')
+        setup.append('    print("RSA public key: n =", K["rsa_n"], " e =", K["rsa_e"])')
+    if enc == "elgamal":
+        if cfg["elgamal_given"]:
+            p, g, x = cfg["elgamal_given"]
+            setup.append('    K["el_p"], K["el_g"], K["el_x"] = %d, %d, %d      # TODO: p, g, x from the question' % (p, g, x))
+            setup.append('    K["el_h"] = pow(K["el_g"], K["el_x"], K["el_p"])')
+        else:
+            setup.append('    K["el_p"], K["el_g"], K["el_h"], K["el_x"] = elgamal_generate_keys()')
+        setup.append('    print("ElGamal public key: p =", K["el_p"], " g =", K["el_g"], " h =", K["el_h"])')
+    if cfg["extra"]:
+        if cfg["extra"].get("given"):
+            p, g, x = cfg["extra"]["given"]
+            setup.append('    K["ex_p"], K["ex_g"], K["ex_x"] = %d, %d, %d      # TODO: p, g, x from the question' % (p, g, x))
+            setup.append('    K["ex_h"] = pow(K["ex_g"], K["ex_x"], K["ex_p"])')
+        else:
+            setup.append('    K["ex_p"], K["ex_g"], K["ex_h"], K["ex_x"] = elgamal_generate_keys()')
+        setup.append('    print("ElGamal for the %s: p =", K["ex_p"], " g =", K["ex_g"], " h =", K["ex_h"])'
+                     % cfg["extra"]["label"].lower())
+    if sig == "elgamal":
+        setup.append('    K["sg_p"], K["sg_g"], K["sg_y"], K["sg_x"] = elgamal_generate_keys()')
+        setup.append('    print("ElGamal signature public key: p =", K["sg_p"], " g =", K["sg_g"], " y =", K["sg_y"])')
+    if sig == "schnorr":
+        setup.append('    K["sc_p"], K["sc_q"], K["sc_g"] = schnorr_generate_domain_parameters()')
+        setup.append('    K["sc_y"], K["sc_x"] = schnorr_generate_keys(K["sc_p"], K["sc_q"], K["sc_g"])')
+        setup.append('    print("Schnorr: p =", K["sc_p"], " q =", K["sc_q"], " g =", K["sc_g"], " y =", K["sc_y"])')
+    if sig == "dsa":
+        setup.append('    K["ds_p"], K["ds_q"], K["ds_g"] = dh_generate_domain_parameters()')
+        setup.append('    K["ds_y"], K["ds_x"] = dh_generate_keys(K["ds_p"], K["ds_q"], K["ds_g"])')
+        setup.append('    print("DSA: p =", K["ds_p"], " q =", K["ds_q"], " g =", K["ds_g"], " y =", K["ds_y"])')
+    if enc == "ecc":
+        setup.append('    K["ecc_priv"], K["ecc_pub"] = ecc_generate_keys()')
+    if enc == "rabin":
+        setup.append('    K["rabin_n"], (K["rabin_p"], K["rabin_q"]) = rabin_generate_keys()')
+        setup.append('    print("Rabin public key n =", K["rabin_n"])')
+    if need_paillier:
+        setup.append('    K["p_n"], K["p_g"], K["p_lam"], K["p_mu"] = paillier_generate_keys(1024)')
+        setup.append('    print("Paillier public key: n =", K["p_n"], " g = n + 1")')
+    if cfg["trustees"]:
+        setup.append('    K["shares"] = threshold_split_key(K["p_n"], K["p_lam"], K["p_mu"], TRUSTEES)')
+        setup.append('    print("Paillier private key split into", TRUSTEES, "trustee shares")')
+    if need_rsa_he:
+        setup.append('    K["he_n"], K["he_e"], K["he_d"] = rsa_he_generate_keys()')
+        setup.append('    print("Textbook RSA (multiplicative) public key: n =", K["he_n"], " e =", K["he_e"])')
+    if need_eg_he:
+        setup.append('    K["eg_p"], K["eg_g"], K["eg_h"], K["eg_x"] = elgamal_he_generate_keys()')
+        setup.append('    print("ElGamal (homomorphic) public key: p =", K["eg_p"], " g =", K["eg_g"], " h =", K["eg_h"])')
+    if "sse" in types:
+        setup.append('    K["sse"] = sse_generate_key()')
+        setup.append('    print("SSE key (hex):", K["sse"].hex())')
+    if cfg["window"]:
+        w = cfg["window"][0].upper() + cfg["window"][1:]
+        setup += ['    now = datetime.now()',
+                  '    print("%s (press Enter for: from now, for 24 hours)")' % w,
+                  '    K["start"] = ask_time("  start (YYYY-MM-DD HH:MM): ", now.strftime("%Y-%m-%d %H:%M"))',
+                  '    K["end"] = ask_time("  end   (YYYY-MM-DD HH:MM): ", (now + timedelta(days=1)).strftime("%Y-%m-%d %H:%M"))',
+                  '    print("%s:", K["start"], "to", K["end"])' % w]
+    if wrap_file:
+        setup += ['    wrapped = rsa_encrypt(K["rsa_pub"], K["sym"].hex())',
+                  '    with open(WRAPPED_KEY_FILE, "w", encoding="utf-8") as f:',
+                  "        f.write(wrapped)",
+                  '    step("%s key encrypted with the RSA public key", wrapped)' % sym_name,
+                  '    print("%s key RSA-encrypted and saved to", WRAPPED_KEY_FILE)' % sym_name]
+    if persist:
+        setup += ["    save_keys()", '    print("Keys saved to", KEYS_FILE, "-- later runs reuse them.")']
+    setup.append('    print("Keys ready.")')
+    if persist:
+        key_names = []
+        for line in setup:
+            # names assigned in setup lines: K["a"], K["b"] = ...   or   K["a"] = ...
+            if line.lstrip().startswith("K[") and " = " in line:
+                for name in re.findall(r'K\["(\w+)"\]', line.split(" = ")[0]):
+                    if not name.endswith("_pub") and name not in key_names:
+                        key_names.append(name)
+        if need_rsa or enc == "ecc":
+            prog.need("from cryptography.hazmat.primitives import serialization")
+        prog.add(fill(r'''
+            # ---------- persistent keys: one name=type:value per line in KEYS_FILE ----------
+            # Public keys are not stored; they are rebuilt from the private keys.
+
+            KEY_NAMES = {{names}}
+
+
+            def save_keys():
+                with open(KEYS_FILE, "w", encoding="utf-8") as f:
+                    for name, value in K.items():
+                        if name.endswith("_pub"):
+                            continue
+                        if isinstance(value, bytes):
+                            kind, text = "hex", value.hex()
+                        elif isinstance(value, int):
+                            kind, text = "int", str(value)
+                        elif isinstance(value, str):
+                            kind, text = "str", value
+                        elif isinstance(value, list):
+                            kind, text = "ints", ",".join(str(v) for v in value)
+                        else:                                   # an RSA / ECC private key object
+                            kind = "pem"
+                            text = value.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                       serialization.NoEncryption()).hex()
+                        f.write(name + "=" + kind + ":" + text + "\n")
+
+
+            def load_keys():
+                with open(KEYS_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        name, rest = line.rstrip("\n").split("=", 1)
+                        kind, text = rest.split(":", 1)
+                        if kind == "hex":
+                            K[name] = bytes.fromhex(text)
+                        elif kind == "int":
+                            K[name] = int(text)
+                        elif kind == "str":
+                            K[name] = text
+                        elif kind == "ints":
+                            K[name] = [int(v) for v in text.split(",")]
+                        else:
+                            K[name] = serialization.load_pem_private_key(bytes.fromhex(text), password=None)
+                for name in list(K):
+                    if name.endswith("_priv"):
+                        K[name[:-len("_priv")] + "_pub"] = K[name].public_key()
+                missing = [name for name in KEY_NAMES if name not in K]
+                if missing:
+                    sys.exit("The keys file is from a different version of this program (missing "
+                             + ", ".join(missing) + "). Delete " + KEYS_FILE + " and the records file.")
+        ''', names=json.dumps(key_names)))
+    prog.add("\n".join(setup))
+
+    # ---------------- crypto zone ----------------
+    z = ["# ==================== EDIT ZONE 1: which crypto ====================",
+         "# Every crypto call goes through these functions. Stored values are",
+         "# strings, so int() happens HERE only.", ""]
+
+    z.append("def encrypt_data(plaintext):")
+    z.append('    """%s. Returns the fields to store."""' % enc_name)
+    if sym:
+        key_line = {"random": 'key = K["sym"]',
+                    "wrap": 'key = get_random_bytes(%d)                  # fresh key for every record' % size,
+                    "typed_once": 'key = K["sym"]',
+                    "typed_each": 'key = normalize_bytes(input("%s key (any text): "), %d)' % (sym_name, size)}[cfg["key_src"]]
+        z.append("    " + key_line)
+        z.append('    step("%s key (hex)", key.hex())' % sym_name)
+        iv_size = 8 if enc == "des" else 16
+        if cfg["iv_src"] == "typed":
+            z.append('    iv = normalize_bytes(input("IV (any text, fitted to %d bytes): "), %d)' % (iv_size, iv_size))
+        elif enc != "3des":
+            z.append("    iv = None                                   # None -> a fresh random IV")
+        call = {"aes128": "aes_encrypt(key, plaintext, iv)", "aes192": "aes_encrypt(key, plaintext, iv)",
+                "aes256": "aes_encrypt(key, plaintext, iv)", "des": 'block_encrypt("des", "cbc", key, plaintext, iv)',
+                "3des": "tripledes_encrypt(key.hex(), plaintext)"}[enc]
+        z.append("    ciphertext = " + call)
+        if enc != "3des":
+            z.append('    step("IV (hex) = first %d hex chars of the ciphertext", ciphertext[:%d])' % (iv_size * 2, iv_size * 2))
+        z.append('    step("%s ciphertext (hex)", ciphertext)' % enc_name)
+        z.append('    fields = {"enc": ciphertext}')
+        if wrap:
+            z.append('    fields["key"] = rsa_encrypt(K["rsa_pub"], key.hex())    # RSA-wrapped key')
+            z.append('    step("%s key encrypted with the RSA public key", fields["key"])' % sym_name)
+        z.append("    return fields")
+    else:
+        call = {"rsa": 'rsa_encrypt(K["rsa_pub"], plaintext)',
+                "elgamal": 'elgamal_encrypt(K["el_p"], K["el_g"], K["el_h"], plaintext)',
+                "ecc": 'ecc_encrypt(K["ecc_pub"], plaintext)',
+                "rabin": 'rabin_encrypt(K["rabin_n"], plaintext)'}[enc]
+        z += ["    ciphertext = " + call, '    step("%s ciphertext", ciphertext)' % enc_name, '    return {"enc": ciphertext}']
+    z += ["", ""]
+    z.append("def decrypt_data(rec, show=True):")
+    if sym:
+        key_line = {"random": 'key = K["sym"]',
+                    "wrap": 'key = bytes.fromhex(rsa_decrypt(K["rsa_priv"], rec["key"]))    # unwrap the key first',
+                    "typed_once": 'key = K["sym"]',
+                    "typed_each": 'key = normalize_bytes(input("%s key (any text): "), %d)' % (sym_name, size)}[cfg["key_src"]]
+        if wrap_file:
+            z += ['    with open(WRAPPED_KEY_FILE, "r", encoding="utf-8") as f:',
+                  "        wrapped = f.read().strip()",
+                  '    key = bytes.fromhex(rsa_decrypt(K["rsa_priv"], wrapped))    # unwrap the key first']
+        else:
+            z.append("    " + key_line)
+        z += ["    if show:"]
+        if wrap_file:
+            z.append('        step("RSA-encrypted key read from " + WRAPPED_KEY_FILE, wrapped)')
+        z.append('        step("%s key %s (hex)", key.hex())'
+                 % (sym_name, "recovered with the RSA private key" if wrap or wrap_file else "used"))
+        call = {"aes128": 'aes_decrypt(key, rec["enc"])', "aes192": 'aes_decrypt(key, rec["enc"])',
+                "aes256": 'aes_decrypt(key, rec["enc"])', "des": 'block_decrypt("des", "cbc", key, rec["enc"])',
+                "3des": 'tripledes_decrypt(key.hex(), rec["enc"])'}[enc]
+    else:
+        call = {"rsa": 'rsa_decrypt(K["rsa_priv"], rec["enc"])',
+                "elgamal": 'elgamal_decrypt(K["el_p"], K["el_x"], rec["enc"])',
+                "ecc": 'ecc_decrypt(K["ecc_priv"], rec["enc"])',
+                "rabin": 'rabin_decrypt(K["rabin_n"], K["rabin_p"], K["rabin_q"], rec["enc"])'}[enc]
+    z += ["    plaintext = " + call, "    if show:", '        step("decrypted plaintext", plaintext)', "    return plaintext", "", ""]
+
+    if cfg["extra"]:
+        z += ["def encrypt_extra(text):",
+              '    ciphertext = elgamal_encrypt(K["ex_p"], K["ex_g"], K["ex_h"], text)',
+              '    step("ElGamal ciphertext of the %s (c1:c2 per character)", ciphertext)' % cfg["extra"]["label"].lower(),
+              "    return ciphertext", "", "",
+              "def decrypt_extra(ciphertext):",
+              '    return elgamal_decrypt(K["ex_p"], K["ex_x"], ciphertext)', "", ""]
+
+    z += ["def hash_fn(text):", "    return %s_hash(text)" % cfg["hash"], "", ""]
+
+    if sig != "none":
+        z.append("def sign(message):")
+        if sig == "rsa":
+            z.append('    return str(rsa_sign(message, K["rsa_d"], K["rsa_n"]))')
+        elif sig == "elgamal":
+            z += ['    r, s = elgamal_sign(message, K["sg_p"], K["sg_g"], K["sg_x"])', '    return str(r) + "," + str(s)']
+        elif sig == "schnorr":
+            z += ['    e, s = schnorr_sign(message, K["sc_p"], K["sc_q"], K["sc_g"], K["sc_x"])', '    return str(e) + "," + str(s)']
+        else:
+            z += ['    r, s = dh_sign(message, K["ds_p"], K["ds_q"], K["ds_g"], K["ds_x"])', '    return str(r) + "," + str(s)']
+        z += ["", "", "def verify_sig(signature, message, show=False):"]
+        if sig == "rsa":
+            z += ['    recovered = rsa_verify(int(signature), K["rsa_e"], K["rsa_n"])',
+                  "    if show:", '        step("signature^e mod n (with the public key) gives", recovered)',
+                  "    return recovered == message"]
+        elif sig == "elgamal":
+            z += ['    r, s = map(int, signature.split(","))', "    if show:", '        step("ElGamal signature (r, s)", (r, s))',
+                  '    return elgamal_verify(message, r, s, K["sg_p"], K["sg_g"], K["sg_y"])']
+        elif sig == "schnorr":
+            z += ['    e, s = map(int, signature.split(","))', "    if show:", '        step("Schnorr signature (e, s)", (e, s))',
+                  '    return schnorr_verify(message, e, s, K["sc_p"], K["sc_q"], K["sc_g"], K["sc_y"])']
+        else:
+            z += ['    r, s = map(int, signature.split(","))', "    if show:", '        step("DSA signature (r, s)", (r, s))',
+                  '    return dh_verify(message, r, s, K["ds_p"], K["ds_q"], K["ds_g"], K["ds_y"])']
+        z += ["", ""]
+
+    if any(op["scheme"] == "p" and op["type"] != "votes" for op in ops):
+        z += ["def he_encrypt_add(x):",
+              '    """Paillier: Enc(a) * Enc(b) mod n^2 = Enc(a + b)."""',
+              '    return str(paillier_encrypt(K["p_n"], K["p_g"], x))', "", ""]
+    if need_rsa_he:
+        z += ["def he_encrypt_mul(x):",
+              '    """Textbook RSA: Enc(a) * Enc(b) mod n = Enc(a * b)."""',
+              '    return str(rsa_he_encrypt(K["he_n"], K["he_e"], x))', "", ""]
+    if need_eg_he:
+        z += ["def eg_text(ciphertext):", '    return str(ciphertext[0]) + "," + str(ciphertext[1])', "", "",
+              "def eg_parse(text):", '    c1, c2 = text.split(",")', "    return int(c1), int(c2)", "", ""]
+    if "e" in schemes:
+        z += ["def he_encrypt_eg(x):",
+              '    """ElGamal: (c1*c1\', c2*c2\') mod p = Enc(a * b). x must be 1 .. p-1."""',
+              '    return eg_text(elgamal_he_encrypt(K["eg_p"], K["eg_g"], K["eg_h"], x))', "", ""]
+    if "x" in schemes:
+        z += ["def he_encrypt_egx(x):",
+              '    """Exponential ElGamal: encrypts g^x, so Enc(g^a) * Enc(g^b) = Enc(g^(a+b))."""',
+              '    return eg_text(elgamal_exp_encrypt(K["eg_p"], K["eg_g"], K["eg_h"], x))', "", ""]
+    if votes_op:
+        z += ["def encrypt_vote(choice):",
+              '    """One-hot ballot: Enc(1) for the chosen option, Enc(0) for every other one."""',
+              '    return ";".join(str(paillier_encrypt(K["p_n"], K["p_g"], 1 if c == choice else 0)) for c in CHOICES)',
+              "", ""]
+    if "p" in schemes:
+        z.append("def decrypt_total(total):")
+        if cfg["trustees"]:
+            z += ['    """Threshold decryption: every trustee uses only its OWN share."""',
+                  "    partials = []",
+                  '    for number, share in enumerate(K["shares"], start=1):',
+                  '        partial = threshold_partial_decrypt(K["p_n"], total, share)',
+                  '        step("trustee " + str(number) + " partial decryption c^share mod n^2", partial)',
+                  "        partials.append(partial)",
+                  '    result = threshold_combine(K["p_n"], partials)',
+                  '    step("all partials multiplied -> (product - 1) // n", result)',
+                  "    return result"]
+        else:
+            z += ['    result = paillier_decrypt(K["p_n"], K["p_lam"], K["p_mu"], total)',
+                  '    step("Paillier decryption L(c^lambda mod n^2) * mu mod n", result)',
+                  "    return result"]
+        z += ["", ""]
+
+    z += ["# ==================== EDIT ZONE 2: what is hashed and signed ====================", ""]
+    z += ["def hashed_part(rec):",
+          '    """Everything except hash and signature -> changing ANY stored value is detected."""',
+          '    return "|".join(rec[name] for name in FIELDS if name not in ("hash", "sig"))', "", ""]
+    if cfg["hash_over"] == "plaintext":
+        z += ["def recompute_hash(rec, show=False):",
+              '    """The hash is of the PLAINTEXT, so the receiver decrypts and hashes again."""',
+              "    return hash_fn(decrypt_data(rec, show))", "", ""]
+    else:
+        z += ["def recompute_hash(rec, show=False):", "    data = hashed_part(rec)", "    if show:",
+              '        step("data hashed (id|ciphertexts|time)", data)', "    return hash_fn(data)", "", ""]
+    if sig != "none":
+        z += ["def signed_part(rec):", '    """The signature covers the hash AND the timestamp (trusted timestamp)."""',
+              '    return rec["hash"] + "|" + rec["time"]', "", ""]
+    z += ["def check_record(rec, show=False):",
+          '    """{check name: True/False} -- never raises. show=True prints every value compared."""',
+          "    result = {}",
+          "    try:",
+          "        recomputed = recompute_hash(rec, show)",
+          '        result["hash"] = recomputed == rec["hash"]',
+          "    except Exception as e:",
+          '        recomputed = "(could not recompute: " + type(e).__name__ + ")"',
+          '        result["hash"] = False',
+          "    if show:",
+          '        show_value("hash received (sender)", rec["hash"])',
+          '        show_value("hash recomputed (now)", recomputed)',
+          '        show_value("hashes match", result["hash"])']
+    if sig != "none":
+        z += ["    try:",
+              "        if show:",
+              '            step("signature received", rec["sig"])',
+              '            step("message it must cover (hash|time)", signed_part(rec))',
+              '        result["signature"] = verify_sig(rec["sig"], signed_part(rec), show)',
+              "    except Exception:",
+              '        result["signature"] = False',
+              "    if show:",
+              '        show_value("signature valid", result["signature"])']
+    if cfg["window"]:
+        z += ['    result["period"] = K["start"] <= rec["time"][:16] <= K["end"]',
+              "    if show:",
+              '        show_value("timestamp", rec["time"])',
+              '        show_value("allowed period", K["start"] + " .. " + K["end"])',
+              '        show_value("inside the period", result["period"])']
+    z += ["    return result", "", "", "def is_valid(rec):", "    return all(check_record(rec).values())"]
+    prog.add("\n".join(z))
+
+    # ---------------- indexes ----------------
+    if index_fields:
+        ix = ["# ---------- indexes: for search AND for filtering homomorphic calculations ----------",
+              "#   plain : field=value | ID  stored in CLEAR (a normal index: the server can read it)"]
+        if "sse" in types:
+            ix.append("#   SSE   : HMAC-SHA256 token | AES-encrypted ID  (server sees neither value nor ID)")
+        if "pkse" in types:
+            ix.append("#   PKSE  : Paillier Enc(hash(word)) | Paillier Enc(ID)  (equality tested homomorphically)")
+        ix += ["", "def index_record(rec_id, words, time_text):", "    plain_index_record(rec_id, words)"]
+        if "sse" in types:
+            ix.append("    sse_index_record(rec_id, words, time_text)")
+        if "pkse" in types:
+            ix.append("    pkse_index_record(rec_id, words)")
+        parts = ["\n".join(ix), block(r'''
+            def plain_index_record(rec_id, words):
+                with open(PLAIN_INDEX_FILE, "a", encoding="utf-8") as f:
+                    for word in words:
+                        f.write(word + "|" + rec_id + "\n")
+                        step("plain index entry", word + " -> " + rec_id)
+
+
+            def plain_search_ids(word):
+                found = set()
+                if os.path.exists(PLAIN_INDEX_FILE):
+                    with open(PLAIN_INDEX_FILE, "r", encoding="utf-8") as f:
+                        for line in f:
+                            stored_word, rec_id = line.rstrip("\n").rsplit("|", 1)
+                            if stored_word == word:
+                                found.add(rec_id)
+                step("plain index: entries equal to '" + word + "'", sorted(found))
+                return sorted(found)
+        ''')]
+        if "sse" in types:
+            parts.append(block(r'''
+                def sse_index_record(rec_id, words, time_text):
+                    words = list(words) + ["hour=" + time_text[:13]]       # for time-range search
+                    with open(SSE_INDEX_FILE, "a", encoding="utf-8") as f:
+                        for word in words:
+                            token = sse_trapdoor(K["sse"], word)
+                            encrypted_id = aes_encrypt(K["sse"], rec_id)
+                            f.write(token + "|" + encrypted_id + "\n")
+                            step("SSE entry HMAC('" + word + "')", token + " -> AES(ID) " + encrypted_id)
+
+
+                def sse_server_lookup(token):
+                    """What the SERVER does: compare tokens, return encrypted IDs."""
+                    found = []
+                    if os.path.exists(SSE_INDEX_FILE):
+                        with open(SSE_INDEX_FILE, "r", encoding="utf-8") as f:
+                            for line in f:
+                                stored_token, encrypted_id = line.rstrip("\n").split("|")
+                                if stored_token == token:
+                                    found.append(encrypted_id)
+                    return found
+
+
+                def sse_search_ids(word):
+                    token = sse_trapdoor(K["sse"], word)                     # encrypt the query
+                    step("query token = HMAC-SHA256(key, '" + word + "')", token)
+                    encrypted_ids = sse_server_lookup(token)
+                    step("encrypted IDs the server returned", encrypted_ids)
+                    ids = sorted(set(aes_decrypt(K["sse"], e) for e in encrypted_ids))
+                    step("IDs after AES decryption", ids)
+                    return ids
+            '''))
+        if "pkse" in types:
+            parts.append(block(r'''
+                def pkse_index_record(rec_id, words):
+                    with open(PKSE_INDEX_FILE, "a", encoding="utf-8") as f:
+                        for word in words:
+                            encrypted_word = paillier_encrypt(K["p_n"], K["p_g"], _word_number(word))
+                            encrypted_id = paillier_encrypt(K["p_n"], K["p_g"], _text_to_number(rec_id))
+                            f.write(str(encrypted_word) + "|" + str(encrypted_id) + "\n")
+                            step("PKSE entry Enc(hash('" + word + "'))", encrypted_word)
+
+
+                def pkse_search_ids(word):
+                    n = K["p_n"]
+                    query = paillier_encrypt(n, K["p_g"], _word_number(word))
+                    step("Enc(hash('" + word + "')) sent to the server", query)
+                    found = set()
+                    if os.path.exists(PKSE_INDEX_FILE):
+                        with open(PKSE_INDEX_FILE, "r", encoding="utf-8") as f:
+                            for number, line in enumerate(f, start=1):
+                                encrypted_word, encrypted_id = map(int, line.rstrip("\n").split("|"))
+                                difference = paillier_subtract(n, encrypted_word, query)                  # server
+                                blinded = paillier_multiply_plain(n, difference, getRandomRange(1, 2 ** 64))
+                                if paillier_decrypt(n, K["p_lam"], K["p_mu"], blinded) == 0:             # key holder
+                                    rec_id = _number_to_text(paillier_decrypt(n, K["p_lam"], K["p_mu"], encrypted_id))
+                                    step("entry " + str(number), "Enc((word - query) * r) decrypts to 0 -> MATCH, ID " + rec_id)
+                                    found.add(rec_id)
+                                else:
+                                    step("entry " + str(number), "decrypts to non-zero -> no match")
+                    return sorted(found)
+            '''))
+        query = [block(r'''
+            def ask_index_query():
+                """Asks which index, which field and which value; returns the matching IDs."""
+                print("Index: plain = normal index stored in clear{{more}}")
+                method = SEARCH_METHODS[0] if len(SEARCH_METHODS) == 1 else ask_choice("Search with", SEARCH_METHODS)
+                fields = [ID_LABEL] + INDEX_FIELDS if method == "plain" else INDEX_FIELDS
+                field = fields[0] if len(fields) == 1 else ask_choice("Search by", fields)
+                value = ask_text(field + " = ")
+                return index_lookup(method, field, value)
+
+
+            def index_lookup(method, field, value):
+                """IDs whose field equals value, looked up in the plain / SSE / PKSE index."""
+                if field == ID_LABEL:
+                    return [value] if find_record(value) is not None else []
+                word = field.lower() + "=" + value.lower()
+                if method == "plain":
+                    return plain_search_ids(word)
+        ''').replace("{{more}}", ("; SSE = HMAC tokens + AES" if "sse" in types else "")
+                     + ("; PKSE = Paillier, public key" if "pkse" in types else ""))]
+        if "sse" in types:
+            query.append('    if method == "SSE":\n        return sse_search_ids(word)')
+        if "pkse" in types:
+            query.append('    if method == "PKSE":\n        return pkse_search_ids(word)')
+        query.append("    return []")
+        parts.append("\n".join(query))
+        if "search_time" in cfg["used"] and "sse" in types:
+            parts.append(block(r'''
+                def hours_between(start, end):
+                    """Every 'YYYY-MM-DD HH' bucket from start to end (both 'YYYY-MM-DD HH:MM')."""
+                    hour = datetime.strptime(start[:13], "%Y-%m-%d %H")
+                    last = datetime.strptime(end[:13], "%Y-%m-%d %H")
+                    buckets = []
+                    while hour <= last:
+                        buckets.append(hour.strftime("%Y-%m-%d %H"))
+                        hour += timedelta(hours=1)
+                    return buckets
+            '''))
+        prog.add("\n\n\n".join(parts))
+
+    # ---------------- plumbing ----------------
+    prog.add(block(r'''
+        # ---------- plumbing: storage (one record per line, fields joined with "|") ----------
+
+        def load_records():
+            records = []
+            if not os.path.exists(RECORDS_FILE):
+                return records
+            with open(RECORDS_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("|")
+                    if len(parts) == len(FIELDS):
+                        records.append(dict(zip(FIELDS, parts)))
+                    elif line.strip():
+                        print("Skipping damaged line in", RECORDS_FILE)
+            return records
+
+
+        def save_records(records):
+            with open(RECORDS_FILE, "w", encoding="utf-8") as f:
+                for rec in records:
+                    f.write("|".join(rec[name] for name in FIELDS) + "\n")
+
+
+        def append_record(rec):
+            with open(RECORDS_FILE, "a", encoding="utf-8") as f:
+                f.write("|".join(rec[name] for name in FIELDS) + "\n")
+
+
+        def find_record(rec_id):
+            """The record with this ID, or None. IDs are compared as strings."""
+            for rec in load_records():
+                if rec["id"] == rec_id:
+                    return rec
+            return None
+
+
+        {{LOG}}
+    ''').replace("{{LOG}}", block(r'''
+        def log_access(action, rec_id, status):
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(timestamp() + "|" + ROLE + "|" + action + "|" + rec_id + "|" + status + "\n")
+    ''') if cfg["access_log"] else block(r'''
+        def log_access(action, rec_id, status):
+            """No access log in this question -- kept so every action can still call it."""
+            return
+    ''')) + ("\n\n\n" + block(r'''
+        def save_decrypted(rec_id, plaintext):
+            """History: one line per successful decryption -- time|role|ID|plaintext (newlines as ' / ')."""
+            with open(DECRYPTED_FILE, "a", encoding="utf-8") as f:
+                f.write(timestamp() + "|" + ROLE + "|" + rec_id + "|" + plaintext.strip().replace("\n", " / ") + "\n")
+            print("  (appended to " + DECRYPTED_FILE + ")")
+    ''') if cfg["decrypted_file"] and "decrypt" in cfg["used"] else ""))
+
+    helpers = [block(r'''
+        # ---------- plumbing: input + output helpers ----------
+
+        def ask_text(prompt):
+            while True:
+                s = input(prompt).strip()
+                if s and "|" not in s:
+                    return s
+                print("Must be non-empty and must not contain '|'.")
+    ''')]
+    if any(f["kind"] == "int" for f in fields):
+        helpers.append(block(r'''
+            def ask_int(prompt, minimum=0):
+                while True:
+                    s = input(prompt).strip()
+                    try:
+                        value = int(s)
+                        if value >= minimum:
+                            return value
+                    except ValueError:
+                        pass
+                    print("Enter a whole number >=", minimum)
+        '''))
+    helpers.append(block(r'''
+        def ask_choice(prompt, options):
+            while True:
+                print(prompt + ": " + ", ".join(str(i) + "=" + o for i, o in enumerate(options, start=1)))
+                s = input("> ").strip()
+                if s.isdigit() and 1 <= int(s) <= len(options):
+                    return options[int(s) - 1]
+                for option in options:
+                    if s.lower() == option.lower():
+                        return option
+                print("Pick one of the listed options.")
+    '''))
+    if any(f["kind"] == "file" for f in fields):
+        helpers.append(block(r'''
+            def ask_file(prompt):
+                """Reads a whole .txt file. A relative name is also tried next to this script."""
+                while True:
+                    path = input(prompt).strip()
+                    for candidate in (path, os.path.join(HERE, path)):
+                        if os.path.isfile(candidate):
+                            with open(candidate, "r", encoding="utf-8") as f:
+                                return f.read()
+                    print("Cannot find", path)
+        '''))
+    if cfg["window"] or "search_time" in cfg["used"]:
+        helpers.append(block(r'''
+            def ask_time(prompt, default=None):
+                while True:
+                    s = input(prompt).strip()
+                    if not s and default is not None:
+                        return default
+                    try:
+                        return datetime.strptime(s, "%Y-%m-%d %H:%M").strftime("%Y-%m-%d %H:%M")
+                    except ValueError:
+                        print("Use the format YYYY-MM-DD HH:MM, e.g. 2026-11-20 09:30")
+        '''))
+    helpers.append(block(r'''
+        def short(s, n=40):
+            return s if len(s) <= n else s[:n] + "..."
+
+
+        def label(ok):
+            return "OK" if ok else "FAILED"
+
+
+        def status_of(result):
+            return "VALID" if all(result.values()) else "INVALID"
+
+
+        def checks_text(result):
+            return " | ".join(name + " " + label(ok) for name, ok in result.items())
+
+
+        def show_full(rec, full=None):
+            """Every stored field; full=True prints the values untruncated."""
+            if full is None:
+                full = SHOW_STEPS
+            width = max(len(name) for name in FIELDS + ["status"])
+            for name in FIELDS:
+                print("  " + name.ljust(width) + " : " + (wrap_value(rec[name], width + 5) if full else short(rec[name], 60)))
+
+
+        def show_results(ids):
+            """Search result: the COMPLETE encrypted record of every match."""
+            section("search result")
+            show_value("matching IDs", ", ".join(ids) if ids else "none")
+            for rec_id in ids:
+                rec = find_record(rec_id)
+                section("record " + rec_id)
+                show_full(rec, full=True)
+                result = check_record(rec)
+                width = max(len(name) for name in FIELDS + ["status"])
+                print("  " + "status".ljust(width) + " : " + checks_text(result) + " -> " + status_of(result))
+
+
+        def safe(fn):
+            """Wrap a menu action: an exception prints instead of crashing the menu."""
+            def run():
+                try:
+                    fn()
+                except Exception as e:
+                    print("Error:", type(e).__name__, e)
+            return run
+
+
+        def run_menu(title, options, back_label="Back"):
+            # from system_parts/role_menu.py
+            while True:
+                print("\n--- " + title + " ---")
+                for number, (text, _) in enumerate(options, start=1):
+                    print(str(number) + ". " + text)
+                print(str(len(options) + 1) + ". " + back_label)
+
+                choice = input("Choice: ").strip()
+
+                if choice == str(len(options) + 1):
+                    return
+                if choice.isdigit() and 1 <= int(choice) <= len(options):
+                    safe(options[int(choice) - 1][1])()
+                else:
+                    print("Invalid choice.")
+    '''))
+    prog.add("\n\n\n".join(helpers))
+
+    # ---------------- actions ----------------
+    noun, Noun = cfg["noun"], cfg["noun"][0].upper() + cfg["noun"][1:]
+    acts = ["# ==================== EDIT ZONE 3: menu actions ===================="]
+
+    a = ["def add_record():",
+         "    rec_id = ask_text(%s)" % q(cfg["id_label"] + ": "),
+         "    if find_record(rec_id) is not None:",
+         "        print(%s, rec_id, \"already exists -- not stored again.\")" % q(cfg["id_label"]),
+         "        return"]
+    for f in fields:
+        if f["kind"] == "text":
+            a.append("    %s = ask_text(%s)" % (f["var"], q(f["label"] + ": ")))
+        elif f["kind"] == "int":
+            a.append("    %s = ask_int(%s)" % (f["var"], q(f["label"] + ": ")))
+        elif f["kind"] == "choice":
+            a.append("    %s = ask_choice(%s, CHOICES)" % (f["var"], q(f["label"])))
+        else:
+            a.append("    %s = ask_file(%s)" % (f["var"], q("File with the " + f["label"].lower() + ": ")))
+    if len(fields) == 1 and fields[0]["kind"] == "file":
+        a.append("    plaintext = " + fields[0]["var"])
+    else:
+        a.append("    plaintext = " + ' + "\\n" + '.join("%s + %s" % (q(f["label"] + ": "), as_text(f)) for f in fields))
+    if cfg["extra"]:
+        a.append("    extra = ask_text(%s)" % q(cfg["extra"]["label"] + ": "))
+    a += ["", '    section("encrypting " + rec_id)', '    step("plaintext", plaintext)',
+          '    rec = {"id": rec_id}', "    rec.update(encrypt_data(plaintext))"]
+    if cfg["extra"]:
+        a.append('    rec["extra"] = encrypt_extra(extra)')
+    done = set()
+    for op in ops:
+        if op["store"] in done:
+            continue
+        done.add(op["store"])
+        if op["type"] == "votes":
+            a += ['    rec["votes"] = encrypt_vote(%s)' % op["var"],
+                  '    step("Paillier one-hot ballot (Enc per option, ; separated)", rec["votes"])']
+        elif op["scheme"] == "m":
+            a += ['    rec["%s"] = he_encrypt_mul(%s)' % (op["store"], op["var"]),
+                  '    step("textbook RSA Enc(%s) = %s^e mod n", rec["%s"])' % (op["label"], op["label"].lower(), op["store"])]
+        elif op["scheme"] == "e":
+            a += ['    rec["%s"] = he_encrypt_eg(%s)' % (op["store"], op["var"]),
+                  '    step("ElGamal Enc(%s) = (g^k, m*h^k) mod p", rec["%s"])' % (op["label"], op["store"])]
+        elif op["scheme"] == "x":
+            a += ['    rec["%s"] = he_encrypt_egx(%s)' % (op["store"], op["var"]),
+                  '    step("exponential ElGamal Enc(g^%s) = (g^k, g^m*h^k) mod p", rec["%s"])' % (op["label"], op["store"])]
+        else:
+            a += ['    rec["%s"] = he_encrypt_add(%s)' % (op["store"], op["var"]),
+                  '    step("Paillier Enc(%s) = g^m * r^n mod n^2", rec["%s"])' % (op["label"], op["store"])]
+    a += ['    rec["time"] = timestamp()', '    step("timestamp", rec["time"])']
+    hname = HASHES[cfg["hash"]]
+    if cfg["hash_over"] == "plaintext":
+        a += ['    step("data hashed (the plaintext)", plaintext)', '    rec["hash"] = hash_fn(plaintext)']
+    else:
+        a += ['    step("data hashed (id|ciphertexts|time)", hashed_part(rec))', '    rec["hash"] = hash_fn(hashed_part(rec))']
+    a.append('    step("%s hash", rec["hash"])' % hname)
+    if sig != "none":
+        a += ['    step("message signed (hash|time)", signed_part(rec))',
+              '    rec["sig"] = sign(signed_part(rec))',
+              '    step("%s", rec["sig"])' % SIGNATURES[sig]]
+    a.append("    append_record(rec)")
+    if index_fields:
+        words = []
+        for label_ in index_fields:
+            f = field_by_label(cfg, label_)
+            words.append("%s + %s.lower()" % (q(f["label"].lower() + "="), as_text(f)))
+        a.append('    index_record(rec_id, [%s], rec["time"])' % ", ".join(words))
+    if cfg["window"]:
+        a += ['    if not K["start"] <= rec["time"][:16] <= K["end"]:',
+              '        print("WARNING: outside the %s -- this %s will fail verification.")' % (cfg["window"], noun)]
+    a += ['    section("%s stored")' % Noun, "    show_full(rec)", '    print("  (saved in " + RECORDS_FILE + ")")']
+    acts.append("\n".join(a))
+
+    if "view" in cfg["used"]:
+        acts.append(block(r'''
+            def view_all():
+                records = load_records()
+                if not records:
+                    print("No records yet.")
+                for rec in records:
+                    section(ID_LABEL + " " + rec["id"])
+                    show_full(rec)
+        '''))
+    if "view_meta" in cfg["used"]:
+        acts.append(block(r'''
+            def view_meta():
+                """ID, timestamp and hash only -- no ciphertext, no decryption."""
+                records = load_records()
+                if not records:
+                    print("No records yet.")
+                for rec in records:
+                    section(ID_LABEL + " " + rec["id"])
+                    show_value("timestamp", rec["time"], 10)
+                    show_value("hash", rec["hash"], 10)
+                    show_value("status", status_of(check_record(rec)), 10)
+        '''))
+    if "verify" in cfg["used"]:
+        acts.append(block(r'''
+            def verify_all():
+                records = load_records()
+                if not records:
+                    print("No records yet.")
+                for rec in records:
+                    section("verifying " + rec["id"])
+                    result = check_record(rec, show=True)
+                    show_value("RESULT", checks_text(result) + "  ->  " + status_of(result))
+                    log_access("verify", rec["id"], status_of(result))
+        '''))
+    if "decrypt" in cfg["used"]:
+        d = ["def decrypt_one():",
+             "    rec = find_record(ask_text(%s))" % q(cfg["id_label"] + " to decrypt: "),
+             "    if rec is None:",
+             '        print("Not found.")',
+             "        return None",
+             '    section("verifying " + rec["id"] + " first")',
+             "    result = check_record(rec, show=True)",
+             '    show_value("RESULT", checks_text(result) + "  ->  " + status_of(result))',
+             "    if not all(result.values()):",
+             '        print("Verification FAILED -- refusing to decrypt.")',
+             '        log_access("decrypt", rec["id"], "DENIED")',
+             "        return None",
+             '    section("decrypting " + rec["id"])',
+             "    try:",
+             "        plaintext = decrypt_data(rec, show=True)",
+             "    except Exception as e:",
+             '        print("Decryption failed (wrong key?):", type(e).__name__, e)',
+             '        log_access("decrypt", rec["id"], "FAILED")',
+             "        return None",
+             '    section("decrypted %s")' % noun,
+             '    for line in plaintext.split("\\n"):',
+             '        print("    " + line)']
+        if cfg["extra"]:
+            d += ['    extra_text = decrypt_extra(rec["extra"])',
+                  '    show_value("%s", extra_text)' % cfg["extra"]["label"]]
+        if cfg["decrypted_file"]:
+            d.append('    save_decrypted(rec["id"], plaintext%s)'
+                     % ('.strip() + "\\n%s: " + extra_text' % cfg["extra"]["label"] if cfg["extra"] else ""))
+        d += ['    log_access("decrypt", rec["id"], "GRANTED")', "    return plaintext"]
+        acts.append("\n".join(d))
+    if "report" in cfg["used"]:
+        acts.append(block(r'''
+            def compliance_report():
+                """Checks every record WITHOUT decrypting anything, writes REPORT_FILE."""
+                records = load_records()
+                lines = ["COMPLIANCE REPORT  " + timestamp(), "records checked: " + str(len(records)), ""]
+                valid = 0
+                for rec in records:
+                    result = check_record(rec)
+                    valid += all(result.values())
+                    lines.append(rec["id"] + " | " + rec["time"] + " | " + checks_text(result) + " | " + status_of(result))
+                lines += ["", "valid: " + str(valid) + "   invalid: " + str(len(records) - valid)]
+                with open(REPORT_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                print("\n".join(lines))
+                print("Report written to", REPORT_FILE)
+                log_access("report", "-", "valid " + str(valid) + "/" + str(len(records)))
+                return valid
+        '''))
+
+    if ops:
+        modes = set(op["select"] for op in ops)
+        sel = [block(r'''
+            # ---------- which records a homomorphic operation uses ----------
+
+            def records_for(ids):
+                records = []
+                for rec_id in ids:
+                    rec = find_record(rec_id)
+                    if rec is None:
+                        print("  ", rec_id, ": not found, skipped")
+                    else:
+                        records.append(rec)
+                print("Selected:", [rec["id"] for rec in records])
+                return records
+
+
+            def select_all():
+                records = load_records()
+                print("Selected: all", len(records), "records")
+                return records
+
+
+            def select_by_ids():
+                return records_for([x.strip() for x in ask_text("IDs, comma separated: ").split(",") if x.strip()])
+        ''')]
+        if index_fields:
+            sel.append(block(r'''
+                def select_by_filter(method, field):
+                    value = ask_text(field + " = ")
+                    print("Filter", field, "=", value, "through the", method, "index")
+                    return records_for(index_lookup(method, field, value))
+            '''))
+        if "ask" in modes:
+            filter_lines = ""
+            if index_fields:
+                filter_lines = '\n    print("3. Filter by a field value (uses the plain / encrypted index)")'
+            sel.append(block(r'''
+                def choose_records(purpose):
+                    """Run-time menu: all records, a list of IDs, or a filter through an index."""
+                    print("Which records go into the " + purpose + "?")
+                    print("1. All records")
+                    print("2. Specific IDs"){{filter}}
+                    choice = input("> ").strip()
+                    if choice == "2":
+                        return select_by_ids()
+                    {{elif}}return select_all()
+            ''').replace("{{filter}}", filter_lines).replace(
+                "{{elif}}", 'if choice == "3":\n        return records_for(ask_index_query())\n    ' if index_fields else ""))
+        acts.append("\n\n\n".join(sel))
+
+    for op in ops:
+        acts.append(he_function(op))
+
+    if "search" in cfg["used"]:
+        acts.append(block(r'''
+            def search_records():
+                """Plain or encrypted index lookup; prints the COMPLETE stored record of every match."""
+                ids = ask_index_query()
+                show_results(ids)
+                log_access("search", ",".join(ids) or "-", str(len(ids)) + " match(es)")
+                return ids
+        '''))
+    if "search_time" in cfg["used"]:
+        t = ["def search_time_range():",
+             "    method = TIME_METHODS[0] if len(TIME_METHODS) == 1 else ask_choice(\"Search with\", TIME_METHODS)",
+             '    start = ask_time("From (YYYY-MM-DD HH:MM): ")',
+             '    end = ask_time("To   (YYYY-MM-DD HH:MM): ")']
+        if "sse" in types:
+            t += ['    if method == "SSE":',
+                  "        ids = set()",
+                  "        for hour in hours_between(start, end):        # the encrypted index works per hour ...",
+                  '            ids.update(sse_search_ids("hour=" + hour))',
+                  "        candidates = [find_record(i) for i in sorted(ids)]",
+                  "    else:",
+                  "        candidates = load_records()                   # plain: read the stored timestamps"]
+        else:
+            t.append("    candidates = load_records()                       # plain: read the stored timestamps")
+        t += ['    found = [rec["id"] for rec in candidates if start <= rec["time"][:16] <= end]   # exact minutes',
+              "    show_results(found)",
+              '    log_access("search", ",".join(found) or "-", start + " .. " + end)',
+              "    return found"]
+        acts.append("\n".join(t))
+    acts.append(block(r'''
+        def tamper_record():
+            """Demo only: change one character of a stored ciphertext."""
+            rec_id = ask_text("ID to tamper with: ")
+            records = load_records()
+            for rec in records:
+                if rec["id"] == rec_id:
+                    c = rec["enc"]
+                    rec["enc"] = c[:-1] + ("0" if c[-1] != "0" else "1")
+                    save_records(records)
+                    print("Changed the last character of the stored ciphertext of", rec_id)
+                    return
+            print("Not found.")
+    '''))
+    prog.add("\n\n\n".join(acts))
+
+    # ---------------- main ----------------
+    labels = action_labels(cfg)
+    fn = {"add": "add_record", "view": "view_all", "view_meta": "view_meta", "verify": "verify_all",
+          "decrypt": "decrypt_one", "report": "compliance_report",
+          "search": "search_records", "search_time": "search_time_range"}
+    for op in ops:
+        fn[op["action"]] = op["action"]
+    data_files = ["RECORDS_FILE", "LOG_FILE"] + index_files
+    if cfg["decrypted_file"] and "decrypt" in cfg["used"]:
+        data_files.append("DECRYPTED_FILE")
+    m = ["def clear_files():",
+         '    """Fresh keys -> old records can never verify again, so start with empty files."""',
+         "    for path in (%s):" % ", ".join(data_files),
+         "        if os.path.exists(path):",
+         "            os.remove(path)", "", "",
+         "def main():", "    global ROLE", "    setup_keys()"]
+    if not persist:
+        m.append("    clear_files()")
+    if cfg["roles"][0][0] is None:
+        m.append('    ROLE = "user"')
+        m.append("    run_menu(%s, [" % q(cfg["name"].upper()))
+        for a_ in cfg["roles"][0][1]:
+            m.append("        (%s, %s)," % (q(labels[a_]), fn[a_]))
+        m.append('        ("(demo) Tamper with a stored %s", tamper_record),' % noun)
+        m.append('    ], back_label="Exit")')
+    else:
+        roles = cfg["roles"]
+        r = len(roles)
+        m += ["    while True:", '        print("\\n===== %s =====")' % cfg["name"].upper()]
+        for i, (role, _) in enumerate(roles, start=1):
+            m.append('        print("%d. %s")' % (i, role))
+        m.append('        print("%d. (demo) Tamper with a stored %s")' % (r + 1, noun))
+        m.append('        print("%d. Exit")' % (r + 2))
+        m.append('        choice = input("Role: ").strip()')
+        m.append("")
+        for i, (role, actions) in enumerate(roles, start=1):
+            m.append('        %s choice == "%d":' % ("if" if i == 1 else "elif", i))
+            m.append("            ROLE = %s" % q(role))
+            m.append("            run_menu(%s, [" % q(role))
+            for a_ in actions:
+                m.append("                (%s, %s)," % (q(labels[a_]), fn[a_]))
+            m.append("            ])")
+        m += ['        elif choice == "%d":' % (r + 1), "            safe(tamper_record)()",
+              '        elif choice == "%d":' % (r + 2), '            print("Bye.")', "            break",
+              "        else:", '            print("Invalid choice.")']
+    prog.add("\n".join(m))
+
+    prog.add(build_records_test(cfg), "import os")
+    prog.add(block('''
+        if __name__ == "__main__":
+            if len(sys.argv) > 1 and sys.argv[1] == "test":
+                self_test()
+            else:
+                main()
+    '''))
+    return prog.render("\n".join(header))
+
+
+def build_records_test(cfg):
+    fields, ops, search = cfg["fields"], cfg["he"], cfg["search"]
+    index_fields, methods, used = cfg["index_fields"], cfg["methods"], cfg["used"]
+    votes_op = [op for op in ops if op["type"] == "votes"]
+    vote_pattern = [0, 1, 0]
+    samples = []
+    for i in range(3):
+        row = {}
+        for f in fields:
+            if f["kind"] == "choice":
+                choices = votes_op[0]["choices"]
+                row[f["var"]] = choices[vote_pattern[i] % len(choices)]
+            elif f["kind"] == "int":
+                row[f["var"]] = str(10 * (i + 1))
+            elif f["kind"] == "file":
+                row[f["var"]] = None
+            else:
+                letters = re.sub(r"[^A-Za-z]", "", f["label"]).upper()[:3] or "VAL"
+                row[f["var"]] = letters + str(i % 2 + 1)        # rows 1 and 3 share a value (for filters)
+        samples.append(row)
+    ids = ["R1", "R2", "R3"]
+    key_answer = [q("examkey123")] if cfg["key_src"] == "typed_each" else []
+
+    def add_answers(i):
+        out = [q(ids[i])]
+        for f in fields:
+            out.append("sample_file" if f["kind"] == "file" else q(samples[i][f["var"]]))
+        if cfg["extra"]:
+            out.append(q("AUTH%d" % (i + 1)))
+        out += key_answer
+        if cfg["iv_src"] == "typed":
+            out.append(q("initvector%d" % (i + 1)))
+        return out
+
+    def query_answers(method, field_label, value):
+        out = [q(method)] if len(methods) > 1 else []
+        choices = ([cfg["id_label"]] + index_fields) if method == "plain" else index_fields
+        if len(choices) > 1:
+            out.append(q(field_label))
+        return out + [q(value)]
+
+    def expected(op, rows):
+        if op["type"] == "votes":
+            return "{%s}" % ", ".join("%s: %d" % (q(c), sum(1 for i in rows if samples[i][op["var"]] == c))
+                                      for c in op["choices"])
+        kind, k = op["type"], 3
+        values = [int(samples[i][op["var"]]) for i in rows]
+        product = 1
+        for v in values:
+            product *= v
+        if kind in ("sum", "eg_sum"):
+            return str(sum(values))
+        if kind == "average":
+            return repr(sum(values) / len(values))
+        if kind == "scaled_sum":
+            return str(k * sum(values))
+        if kind in ("product", "eg_product"):
+            return str(product)
+        if kind in ("scaled_product", "eg_scaled_product"):
+            return str(k * product)
+        each = {"add_const": lambda v: v + k, "scale_each": lambda v: k * v, "rsa_scale_each": lambda v: k * v,
+                "eg_scale_each": lambda v: k * v, "rsa_power": lambda v: v ** k, "eg_power": lambda v: v ** k,
+                "compare": lambda v: v > 15}[kind]
+        return "{%s}" % ", ".join("%s: %r" % (q(ids[i]), each(int(samples[i][op["var"]]))) for i in rows)
+
+    def extra(op):
+        if op["type"] in NEEDS_K:
+            return [q("3")]
+        return [q("15")] if op["type"] == "compare" else []
+
+    t = ["# ---------- self-test:  python %s test ----------" % os.path.basename(cfg["out"]), "",
+         "def self_test():",
+         "    import builtins",
+         "    import tempfile"]
+    files = ["RECORDS_FILE", "LOG_FILE"]
+    if cfg["persist"]:
+        files.append("KEYS_FILE")
+    if cfg["wrap"] == "file":
+        files.append("WRAPPED_KEY_FILE")
+    decrypted = cfg["decrypted_file"] and "decrypt" in used
+    if decrypted:
+        files.append("DECRYPTED_FILE")
+    if "report" in used:
+        files.append("REPORT_FILE")
+    if index_fields:
+        files.append("PLAIN_INDEX_FILE")
+    if "sse" in cfg["index_types"]:
+        files.append("SSE_INDEX_FILE")
+    if "pkse" in cfg["index_types"]:
+        files.append("PKSE_INDEX_FILE")
+    t += ["    global " + ", ".join(files), "", "    tmp = tempfile.mkdtemp()"]
+    for name in files:
+        t.append('    %s = os.path.join(tmp, "%s.txt")' % (name, name[:-5].lower()))
+    if any(f["kind"] == "file" for f in fields):
+        t += ['    sample_file = os.path.join(tmp, "sample.txt")',
+              '    with open(sample_file, "w", encoding="utf-8") as f:',
+              '        f.write("Sample document\\nLine two of the file\\n")']
+    if "search_time" in used:
+        t += ['    hour_ago = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")',
+              '    hour_later = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")']
+    t += ["",
+          "    queue = []",
+          "",
+          '    def fake_input(prompt=""):',
+          "        if not queue:",
+          '            raise RuntimeError("self-test has no answer for the prompt " + repr(prompt))',
+          "        answer = queue.pop(0)",
+          "        print(prompt + answer)",
+          "        return answer",
+          "",
+          "    builtins.input = fake_input",
+          "",
+          "    def run(fn, *answers):",
+          "        queue[:] = list(answers)",
+          '        print("\\n>>>", fn.__name__, answers)',
+          "        return fn()",
+          ""]
+    setup_answers = []
+    if cfg["key_src"] == "typed_once":
+        setup_answers.append(q("examkey123"))
+    if cfg["window"]:
+        setup_answers += [q(""), q("")]
+    t += ["    queue[:] = [%s]" % ", ".join(setup_answers), "    setup_keys()", ""]
+    for i in range(3):
+        t.append("    run(add_record, %s)" % ", ".join(add_answers(i)))
+    t += ["    run(add_record, %s)                       # duplicate ID is refused" % q(ids[0]),
+          "    assert len(load_records()) == 3",
+          "    assert all(is_valid(rec) for rec in load_records())"]
+    if cfg["persist"]:
+        t += ["",
+              "    # restart: keys come back from KEYS_FILE, old records must still verify",
+              "    K.clear()",
+              "    queue[:] = []",
+              "    setup_keys()",
+              "    assert all(is_valid(rec) for rec in load_records())",
+              ""]
+    for a_, call in (("view", "view_all"), ("view_meta", "view_meta"), ("verify", "verify_all")):
+        if a_ in used:
+            t.append("    run(%s)" % call)
+    if "decrypt" in used:
+        t.append("    assert run(decrypt_one, %s) is not None" % ", ".join([q(ids[0])] + key_answer))
+        if decrypted:
+            t.append('    assert len(open(DECRYPTED_FILE, encoding="utf-8").read().splitlines()) == 1')
+    if "report" in used:
+        t.append("    assert run(compliance_report) == 3")
+
+    filter_rows = None
+    if index_fields:
+        f0 = field_by_label(cfg, index_fields[0])
+        value = samples[0][f0["var"]]
+        filter_rows = [i for i in range(3) if samples[i][f0["var"]].lower() == value.lower()]
+    if "search" in used:
+        for method in methods:
+            t.append("    assert run(search_records, %s) == %s"
+                     % (", ".join(query_answers(method, f0["label"], value)), json.dumps([ids[i] for i in filter_rows])))
+        t.append("    assert run(search_records, %s) == []"
+                 % ", ".join(query_answers(methods[-1], f0["label"], "nothing-like-this")))
+        if "plain" in methods:
+            t.append("    assert run(search_records, %s) == [\"R2\"]" % ", ".join(query_answers("plain", cfg["id_label"], "R2")))
+    if "search_time" in used:
+        for method in cfg["time_methods"]:
+            ans = ([q(method)] if len(cfg["time_methods"]) > 1 else []) + ["hour_ago", "hour_later"]
+            t.append("    assert run(search_time_range, %s) == %s" % (", ".join(ans), json.dumps(ids)))
+    for op in ops:
+        if op["action"] not in used:
+            continue
+        if op["type"] == "difference":
+            diff = int(samples[2][op["var"]]) - int(samples[0][op["var"]])
+            t.append('    assert run(%s, "R3", "R1") == %d' % (op["action"], diff))
+            t.append('    assert run(%s, "R1", "R3") == %d                # negative result' % (op["action"], -diff))
+            continue
+        more = extra(op)
+        if op["select"] == "ask":
+            t.append("    assert run(%s) == %s                      # menu: all"
+                     % (", ".join([op["action"], q("1")] + more), expected(op, [0, 1, 2])))
+            t.append("    assert run(%s) == %s          # menu: chosen IDs"
+                     % (", ".join([op["action"], q("2"), q("R1, R3")] + more), expected(op, [0, 2])))
+            if index_fields:
+                method = methods[-1]
+                t.append("    assert run(%s) == %s          # menu: filter %s via %s"
+                         % (", ".join([op["action"], q("3")] + query_answers(method, f0["label"], value) + more),
+                            expected(op, filter_rows), index_fields[0], method))
+        elif op["select"] == "all":
+            t.append("    assert run(%s) == %s                      # always all records"
+                     % (", ".join([op["action"]] + more), expected(op, [0, 1, 2])))
+        elif op["select"] == "ids":
+            t.append("    assert run(%s) == %s          # typed IDs"
+                     % (", ".join([op["action"], q("R1, R3")] + more), expected(op, [0, 2])))
+        else:
+            ff = field_by_label(cfg, op["filter_field"])
+            v = samples[0][ff["var"]]
+            rows = [i for i in range(3) if samples[i][ff["var"]].lower() == v.lower()]
+            t.append("    assert run(%s) == %s          # fixed filter %s via %s"
+                     % (", ".join([op["action"], q(v)] + more), expected(op, rows), ff["label"], op["filter_method"]))
+    t += ["",
+          "    # tamper with R2: every check must now refuse it",
+          '    run(tamper_record, "R2")',
+          '    assert not is_valid(find_record("R2"))']
+    if "verify" in used:
+        t.append("    run(verify_all)")
+    if "decrypt" in used:
+        t.append('    assert run(decrypt_one, "R2") is None')
+        if decrypted:
+            t.append('    assert len(open(DECRYPTED_FILE, encoding="utf-8").read().splitlines()) == 1   # refused -> not written')
+    if "report" in used:
+        t.append("    assert run(compliance_report) == 2")
+    for op in ops:
+        if op["action"] in used and op["type"] == "difference":
+            t.append('    assert run(%s, "R2", "R1") is None              # tampered R2 refused' % op["action"])
+        elif op["action"] in used:
+            if op["select"] == "filter":
+                ff = field_by_label(cfg, op["filter_field"])
+                v = samples[0][ff["var"]]
+                rows = [i for i in range(3) if i != 1 and samples[i][ff["var"]].lower() == v.lower()]
+                answers, rows_after = [q(v)], rows
+            else:
+                answers = {"ask": [q("1")], "all": [], "ids": [q("R1, R2, R3")]}[op["select"]]
+                rows_after = [0, 2]
+            t.append("    assert run(%s) == %s                 # R2 no longer counted"
+                     % (", ".join([op["action"]] + answers + extra(op)), expected(op, rows_after)))
+    t += ["", '    print("\\nSELF-TEST PASSED")']
+    return "\n".join(t)
+
+
+# =============================================================================
+#  2. key exchange + classical cipher (FieldTrack style)
+# =============================================================================
+
+KX_DEFAULTS = {
+    "name": "FieldTrack",
+    "out": "fieldtrack.py",
+    "p": 23, "g": 5,                       # TODO numbers from the question
+    "sender_private": 6, "receiver_private": 15,   # None -> random
+    "cipher": "affine",                    # affine | additive | multiplicative
+    "k2": 2,                               # affine: None -> k2 = K mod 26, else check K mod 26 == k2
+}
+
+
+def build_kx(cfg):
+    cfg = dict(KX_DEFAULTS, **cfg)
+    cipher = cfg["cipher"]
+    prog = Program()
+    header = "\n".join([
+        "# %s  --  generated by reference/generate.py" % cfg["name"],
+        "#",
+        "# Sender and Receiver agree on a Diffie-Hellman shared secret K (and check",
+        "# that both computed the same K), then use it for a %s cipher on" % cipher,
+        "# UPPERCASE A-Z text (everything else is removed first).",
+        {"affine": "#   C = (k1 * P + k2) mod 26     P = (k1^-1 * (C - k2)) mod 26\n"
+                   "#   k2 %s; k1 is typed and must satisfy gcd(k1, 26) = 1\n"
+                   "#   (an invalid k1 is discarded and asked for again)."
+                   % ("= K mod 26" if cfg["k2"] is None else "is given and must equal K mod 26"),
+         "additive": "#   C = (P + k) mod 26 with k = K mod 26",
+         "multiplicative": "#   C = (k1 * P) mod 26, k1 typed, gcd(k1, 26) must be 1"}[cipher],
+        "#",
+        "# Run:  python %s         python %s test" % (os.path.basename(cfg["out"]), os.path.basename(cfg["out"]))])
+
+    prog.use("dh.py", "dh_generate_keypair", "compute_shared_secret")
+    prog.add(fill(r'''
+        # ---------- adapted from ciphers/primitives.py: UPPERCASE alphabet ----------
+
+        A = string.ascii_uppercase
+
+
+        def clean(text):
+            """Uppercase, keep A-Z only."""
+            return "".join(c for c in text.upper() if c in A)
+
+
+        def affine_encrypt(text, a, b):
+            return "".join(A[(a * A.index(c) + b) % 26] for c in text)
+
+
+        def affine_decrypt(text, a, b):
+            inv = pow(a, -1, 26)
+            return "".join(A[(inv * (A.index(c) - b)) % 26] for c in text)
+    '''), "import string", "import math", "import sys")
+
+    priv = lambda v: "None" if v is None else str(v)
+    consts = ["# ==================== EDIT ZONE: the numbers given in the question ====================", "",
+              "P = %d                       # TODO: DH prime p" % cfg["p"],
+              "G = %d                        # TODO: DH generator g" % cfg["g"],
+              "SENDER_PRIVATE = %s          # TODO: None -> random" % priv(cfg["sender_private"]),
+              "RECEIVER_PRIVATE = %s        # TODO: None -> random" % priv(cfg["receiver_private"])]
+    if cipher == "affine":
+        consts.append("K2 = %s                       # TODO: k2 given in the question (None -> k2 = K mod 26)" % priv(cfg["k2"]))
+    prog.add("\n".join(consts))
+
+    body = [block(r'''
+        def private_key(given):
+            if given is not None:
+                return given, pow(G, given, P)
+            return dh_generate_keypair(P, G)
+
+
+        def key_exchange():
+            print("Public parameters: p =", P, " g =", G)
+            a, sender_public = private_key(SENDER_PRIVATE)
+            b, receiver_public = private_key(RECEIVER_PRIVATE)
+            print("Sender   private a =", a, " public A = g^a mod p =", sender_public)
+            print("Receiver private b =", b, " public B = g^b mod p =", receiver_public)
+
+            sender_secret = compute_shared_secret(receiver_public, a, P)       # B^a mod p
+            receiver_secret = compute_shared_secret(sender_public, b, P)       # A^b mod p
+            print("Sender   computes K = B^a mod p =", sender_secret)
+            print("Receiver computes K = A^b mod p =", receiver_secret)
+            if sender_secret != receiver_secret:
+                print("FAILURE: the shared secrets differ -- stopping.")
+                return None, None
+            print("Shared secrets match: K =", sender_secret)
+            return sender_secret, receiver_secret
+    ''')]
+    if cipher in ("affine", "multiplicative"):
+        body.append(block(r'''
+            def ask_k1(who):
+                """Asks until k1 is a whole number with gcd(k1, 26) = 1; invalid values are discarded."""
+                while True:
+                    s = input(who + ": enter k1 (gcd(k1, 26) must be 1): ").strip()
+                    try:
+                        k1 = int(s)
+                    except ValueError:
+                        print("  INVALID: k1 must be a whole number -- discarded.")
+                        continue
+                    if math.gcd(k1, 26) != 1:
+                        print("  INVALID: gcd(" + str(k1) + ", 26) =", math.gcd(k1, 26), "-> no inverse mod 26, k1 discarded.")
+                        continue
+                    inverse = pow(k1, -1, 26)
+                    print("  k1 =", k1, "accepted. Inverse of k1 mod 26 =", inverse,
+                          "(check:", k1, "*", inverse, "mod 26 =", (k1 * inverse) % 26, ")")
+                    return k1
+        '''))
+    if cipher == "affine":
+        body.append(block(r'''
+            def get_k2(who, K):
+                print(who + ": K mod 26 =", K % 26)
+                if K2 is None:
+                    print("  k2 = K mod 26 =", K % 26)
+                    return K % 26
+                if K % 26 != K2:
+                    print("  FAILURE: K mod 26 =", K % 26, "but k2 =", K2, "-- keys do not match, stopping.")
+                    return None
+                print("  K mod 26 == k2 =", K2, "-> OK")
+                return K2
+        '''))
+        enc_keys = ["    k2 = get_k2(who, K)", "    if k2 is None:", "        return None", "    k1 = ask_k1(who)"]
+        enc_call, dec_call = "affine_encrypt(text, k1, k2)", "affine_decrypt(text, k1, k2)"
+    elif cipher == "additive":
+        enc_keys = ["    k = K % 26", '    print(who + ": k = K mod 26 =", k)', "    if k == 0:",
+                    '        print("  FAILURE: k = 0 would leave the text unchanged -- stopping.")', "        return None"]
+        enc_call, dec_call = "affine_encrypt(text, 1, k)", "affine_decrypt(text, 1, k)"
+    else:
+        enc_keys = ["    k1 = ask_k1(who)"]
+        enc_call, dec_call = "affine_encrypt(text, k1, 0)", "affine_decrypt(text, k1, 0)"
+
+    body.append("\n".join(["def sender_side(K):", '    who = "Sender"', '    print("\\n--- SENDER ---")'] + enc_keys + [
+        '    text = clean(input("Sender: message: "))',
+        "    if not text:",
+        '        print("  FAILURE: no letters A-Z in the message -- nothing to encrypt.")',
+        "        return None",
+        '    print("  plaintext (A-Z only):", text)',
+        "    ciphertext = " + enc_call,
+        '    print("  ciphertext          :", ciphertext)',
+        "    return text, ciphertext"]))
+    body.append("\n".join(["def receiver_side(K, ciphertext):", '    who = "Receiver"', '    print("\\n--- RECEIVER ---")'] + enc_keys + [
+        "    text = clean(ciphertext)",
+        "    if text != ciphertext:",
+        '        print("  FAILURE: ciphertext contains characters outside A-Z.")',
+        "        return None",
+        "    plaintext = " + dec_call,
+        '    print("  decrypted plaintext :", plaintext)',
+        "    return plaintext"]))
+    body.append(block(r'''
+        def main():
+            sender_secret, receiver_secret = key_exchange()
+            if sender_secret is None:
+                return None
+            sent = sender_side(sender_secret)
+            if sent is None:
+                return None
+            plaintext, ciphertext = sent
+            received = receiver_side(receiver_secret, ciphertext)
+            if received is None:
+                return None
+            if received == plaintext:
+                print("\nSUCCESS: the Receiver recovered exactly the Sender's message.")
+            else:
+                print("\nFAILURE: decrypted text differs from the original (different k1?).")
+            return received
+
+
+        def self_test():
+            import builtins
+            queue = []
+
+            def fake_input(prompt=""):
+                answer = queue.pop(0)
+                print(prompt + answer)
+                return answer
+
+            builtins.input = fake_input
+    '''))
+    test = []
+    if cipher in ("affine", "multiplicative"):
+        test.append('    queue[:] = ["13", "abc", "5", "Field team at grid 7, move north!", "4", "5"]')
+        if cipher == "affine":
+            test.append('    expected = "FIELDTEAMATGRIDMOVENORTH" if SENDER_PRIVATE is not None and RECEIVER_PRIVATE is not None '
+                        'and (K2 is None or pow(G, SENDER_PRIVATE * RECEIVER_PRIVATE, P) % 26 == K2) else None')
+        else:
+            test.append('    expected = "FIELDTEAMATGRIDMOVENORTH"')
+    else:
+        test.append('    queue[:] = ["Field team at grid 7, move north!"]')
+        test.append('    expected = "FIELDTEAMATGRIDMOVENORTH" if SENDER_PRIVATE is not None and RECEIVER_PRIVATE is not None else None')
+    test += ["    result = main()", "    if expected is not None:", "        assert result == expected, result",
+             '    print("\\nSELF-TEST PASSED")']
+    body[-1] = body[-1] + "\n" + "\n".join(test)
+    prog.add("\n\n\n".join(body))
+    prog.add(block('''
+        if __name__ == "__main__":
+            if len(sys.argv) > 1 and sys.argv[1] == "test":
+                self_test()
+            else:
+                main()
+    '''))
+    return prog.render(header)
+
+
+# =============================================================================
+#  presets: the sample questions
+# =============================================================================
+
+PRESETS = {
+    "evoting": {
+        "_about": "E-voting: AES-256 ballot, RSA-4096 wrapped key, SHA-512, ElGamal sig, Paillier tally, "
+                  "threshold decryption, plain/SSE/PKSE search by constituency + time, voting period",
+        "name": "Secure E-Voting System", "out": "evoting.py", "noun": "ballot", "id_label": "Voter ID",
+        "fields": "Candidate, Constituency",
+        "enc": "aes256", "key_src": "wrap", "rsa_bits": 4096,
+        "hash": "sha512", "hash_over": "plaintext", "sig": "elgamal",
+        "he": [{"type": "votes", "field": "Candidate", "choices": ["Alice", "Bob", "Carol"], "select": "all"}],
+        "trustees": 3,
+        "search": {"types": ["sse", "pkse"], "fields": ["Constituency"], "time": True},
+        "window": "voting period",
+        "labels": {"add": "Cast ballot", "votes_candidate": "Tally votes (threshold-decrypt only the totals)"},
+        "roles": [["Voter", ["add"]],
+                  ["Election Server", ["verify", "view_meta", "search", "search_time"]],
+                  ["Trustee Panel", ["tally"]],
+                  ["Auditor", ["report", "view"]]],
+    },
+    "employee": {
+        "_about": "Employee payroll: AES-256 + RSA sig + SHA-256, EVERY homomorphic operation (Paillier sum/average/"
+                  "x k/+k/difference/threshold, RSA + ElGamal product/x k/power, exponential-ElGamal sum), "
+                  "records by ID or department filter, plain/SSE/PKSE search",
+        "name": "Secure Payroll System", "out": "payroll.py", "noun": "employee record", "id_label": "Employee ID",
+        "fields": "Name, Department, Salary:int, Bonus factor:int",
+        "enc": "aes256", "hash": "sha256", "sig": "rsa",
+        # "select" = how each action picks its records: all | ids | filter (fixed field + index) | ask (menu)
+        "he": [{"type": "sum", "field": "Salary", "select": "filter", "filter_field": "Department", "filter_method": "sse"},
+               {"type": "average", "field": "Salary", "select": "ids"},
+               {"type": "scaled_sum", "field": "Salary", "select": "all"},
+               {"type": "add_const", "field": "Salary", "select": "ids"},
+               {"type": "scale_each", "field": "Salary", "select": "ask"},
+               {"type": "difference", "field": "Salary"},
+               {"type": "compare", "field": "Salary", "select": "filter", "filter_field": "Department", "filter_method": "plain"},
+               {"type": "eg_sum", "field": "Salary", "select": "all"},
+               {"type": "product", "field": "Bonus factor", "select": "filter", "filter_field": "Department",
+                "filter_method": "pkse"},
+               {"type": "scaled_product", "field": "Bonus factor", "select": "ids"},
+               {"type": "rsa_scale_each", "field": "Bonus factor", "select": "ids"},
+               {"type": "rsa_power", "field": "Bonus factor", "select": "ask"},
+               {"type": "eg_product", "field": "Bonus factor", "select": "all"},
+               {"type": "eg_scaled_product", "field": "Bonus factor", "select": "ids"},
+               {"type": "eg_scale_each", "field": "Bonus factor", "select": "filter", "filter_field": "Name"},
+               {"type": "eg_power", "field": "Bonus factor", "select": "ids"}],
+        "search": {"types": ["sse", "pkse"], "fields": ["Department", "Name"], "time": True},
+        "roles": [["HR", ["add", "view"]],
+                  ["Manager", ["verify", "decrypt", "search", "sum_salary", "average_salary", "compare_salary"]],
+                  ["Finance", ["tally"]],
+                  ["Auditor", ["report", "view_meta", "search_time"]]],
+    },
+    "securevault": {
+        "_about": "SecureVault: DES-CBC + IV, SHA-256 of ciphertext, ElGamal sig; Client / Lawyer / Compliance Officer",
+        "name": "SecureVault", "out": "securevault.py", "noun": "document", "id_label": "Case ID",
+        "fields": "Client Name, Document",
+        "enc": "des", "key_src": "random", "iv_src": "random",
+        "hash": "sha256", "hash_over": "ciphertext", "sig": "elgamal",
+        "roles": [["Client", ["add", "view"]],
+                  ["Lawyer", ["decrypt", "view"]],
+                  ["Compliance Officer", ["verify", "report", "view_meta"]]],
+    },
+    "healthsecure": {
+        "_about": "HealthSecure: RSA-encrypted patient fields, SHA-256 of ciphertext, RSA sig; Doctor / Nurse / Admin",
+        "name": "HealthSecure", "out": "healthsecure.py", "noun": "patient record", "id_label": "Patient ID",
+        "fields": "Name, Diagnosis, Treatment",
+        "enc": "rsa", "hash": "sha256", "hash_over": "ciphertext", "sig": "rsa",
+        "roles": [["Doctor", ["add", "view", "decrypt"]],
+                  ["Nurse", ["verify"]],
+                  ["Admin", ["view_meta"]]],
+    },
+    "hospital": {
+        "_about": "Hospital: file -> AES-128, AES key RSA-encrypted in a file, ElGamal auth code (given p,g,x), SHA-256, "
+                  "sender/receiver hash check, tamper demo",
+        "name": "Hospital Secure File Transfer", "out": "hospital.py", "noun": "file", "id_label": "File ID",
+        "fields": "Report:file",
+        "enc": "aes128", "key_src": "random", "wrap": "file",
+        "extra": {"label": "Authorization code", "given": [7919, 2, 1234]},
+        "hash": "sha256", "hash_over": "ciphertext", "sig": "none",
+        "roles": [["Sender", ["add", "view"]],
+                  ["Receiver", ["verify", "decrypt"]]],
+    },
+    "medisecure": {
+        "_about": "MediSecure: AES with typed key + typed IV, SHA-256, RSA sig; Patient / Doctor / Auditor",
+        "name": "MediSecure", "out": "medisecure_gen.py", "noun": "medical record", "id_label": "Patient ID",
+        "fields": "Name, Symptoms",
+        "enc": "aes128", "key_src": "typed_once", "iv_src": "typed",
+        "hash": "sha256", "hash_over": "ciphertext", "sig": "rsa",
+        "roles": [["Patient", ["add", "view"]],
+                  ["Doctor", ["verify", "decrypt"]],
+                  ["Auditor", ["view_meta", "report"]]],
+    },
+    "grant": {
+        "_about": "Grant portal: AES-192 description, Paillier SUM of amount, MD5, RSA sig, SSE search by department",
+        "name": "Secure Grant Expense Portal", "out": "grant_portal.py", "noun": "grant", "id_label": "Grant ID",
+        "fields": "Department, Description, Amount:int",
+        "enc": "aes192", "hash": "md5", "sig": "rsa",
+        "he": [{"type": "sum", "field": "Amount", "select": "ids"}],
+        "search": {"types": ["sse"], "fields": ["Department"], "time": False},
+        "roles": [["Researcher", ["add", "view"]],
+                  ["Reviewer", ["verify", "search", "decrypt"]],
+                  ["Finance Officer", ["tally"]]],
+    },
+    "fieldtrack": {
+        "_about": "FieldTrack: DH shared secret (p=23, g=5), affine cipher with k2 = 2 checked against K mod 26, k1 validated",
+        "_kind": "kx",
+        "name": "FieldTrack", "out": "fieldtrack.py",
+        "p": 23, "g": 5, "sender_private": 6, "receiver_private": 15, "cipher": "affine", "k2": 2,
+    },
+}
+
+
+# =============================================================================
+#  the questions
+# =============================================================================
+
+def ask(prompt, default=""):
+    s = input("%s [%s]: " % (prompt, default)).strip()
+    return s if s else str(default)
+
+
+def ask_num(prompt, default):
+    while True:
+        s = ask(prompt, default)
+        try:
+            return int(s)
+        except ValueError:
+            print("  a whole number please")
+
+
+def pick(prompt, options, default):
+    """options: list of (value, text). Returns the value."""
+    print(prompt)
+    for i, (value, text) in enumerate(options, start=1):
+        print("  %d) %s" % (i, text))
+    while True:
+        s = ask("  choice", default)
+        if s.isdigit() and 1 <= int(s) <= len(options):
+            return options[int(s) - 1][0]
+        for value, _ in options:
+            if s.lower() == str(value).lower():
+                return value
+        print("  pick a number from the list")
+
+
+def yes(prompt, default="n"):
+    return ask(prompt + " (y/n)", default).lower().startswith("y")
+
+
+def ask_fields(prompt, labels):
+    """Field names or their numbers, comma separated; asks again until every one exists."""
+    print(prompt + ": " + ", ".join("%d=%s" % (i, l) for i, l in enumerate(labels, start=1)))
+    while True:
+        chosen = []
+        for part in ask("  names or numbers, comma separated", "1").split(","):
+            part = part.strip()
+            if part.isdigit() and 1 <= int(part) <= len(labels):
+                chosen.append(labels[int(part) - 1])
+            elif part.lower() in [l.lower() for l in labels]:
+                chosen.append(next(l for l in labels if l.lower() == part.lower()))
+            elif part:
+                print("  no field called", repr(part))
+                chosen = None
+                break
+        if chosen:
+            return chosen
+
+
+def ask_given(prompt):
+    s = ask(prompt + " -- type p,g,x or Enter to generate", "")
+    if not s:
+        return None
+    p, g, x = (int(v) for v in s.replace(" ", "").split(","))
+    return [p, g, x]
+
+
+def interview_records():
+    cfg = {}
+    cfg["name"] = ask("System name", DEFAULTS["name"])
+    cfg["noun"] = ask("What is ONE stored item called (record, ballot, document, ...)", "record")
+    cfg["id_label"] = ask("Name of its ID field (asked separately -- don't list it again below)", "Record ID")
+    print("OTHER data fields to encrypt, comma separated. Add :int for numbers, :file to read a .txt file.")
+    cfg["fields"] = ask("  fields", "Name, Details")
+    fields = parse_fields(cfg["fields"])
+
+    cfg["enc"] = pick("Encrypt the data with:", [("aes128", "AES-128"), ("aes192", "AES-192"), ("aes256", "AES-256"),
+                                                ("des", "DES (CBC, with IV)"), ("3des", "Triple DES"),
+                                                ("rsa", "RSA (OAEP, short data only)"), ("elgamal", "ElGamal"),
+                                                ("ecc", "ECC"), ("rabin", "Rabin")], 3)
+    if cfg["enc"] in SYMMETRIC:
+        cfg["key_src"] = pick("Where does the key come from?", [
+            ("random", "random, generated by the program"),
+            ("typed_once", "typed by the user once at start-up"),
+            ("typed_each", "typed by the user when encrypting AND when decrypting")], 1)
+        cfg["wrap"] = pick("Encrypt the key with RSA?", [
+            ("none", "no"),
+            ("record", "yes -- a FRESH random key per record, RSA-encrypted and stored in the record (hybrid)"),
+            ("file", "yes -- ONE key, RSA-encrypted and saved to its own file (receiver unwraps it)")], 1)
+        if cfg["wrap"] != "none":
+            cfg["rsa_bits"] = ask_num("RSA key size for encrypting the key", 2048)
+        if cfg["enc"] != "3des":
+            cfg["iv_src"] = pick("IV:", [("random", "random per record"), ("typed", "typed by the user")], 1)
+    if cfg["enc"] == "rsa":
+        cfg["rsa_bits"] = ask_num("RSA key size", 2048)
+    if cfg["enc"] == "elgamal":
+        cfg["elgamal_given"] = ask_given("ElGamal parameters given in the question?")
+
+    cfg["hash"] = pick("Hash:", [("sha256", "SHA-256"), ("sha512", "SHA-512"), ("sha1", "SHA-1"), ("md5", "MD5")], 1)
+    cfg["hash_over"] = pick("Hash of:", [("ciphertext", "the ciphertext (can be checked without decrypting)"),
+                                         ("plaintext", "the plaintext (receiver decrypts, then re-hashes)")], 1)
+    cfg["sig"] = pick("Digital signature (signs hash|timestamp):", [(k, v) for k, v in SIGNATURES.items()], 2)
+
+    if yes("A separate small value encrypted with ElGamal (e.g. an authorization code)?"):
+        cfg["extra"] = {"label": ask("  its name", "Authorization code"),
+                        "given": ask_given("  ElGamal parameters for it given?")}
+
+    ops = []
+    print("Homomorphic operations (lab 7) -- add as many as you need, each becomes its own menu action.")
+    print("  (not possible with these schemes: Paillier ct*ct, RSA addition, plain-ElGamal addition)")
+    while True:
+        kind = pick("  add an operation:", [("done", "done / none")] + [(k, v) for k, v in HE_TYPES.items()], 1)
+        if kind == "done":
+            break
+        candidates = [f["label"] for f in fields if f["kind"] != "file"]
+        field = pick("    on which field?", [(l, l) for l in candidates], 1)
+        op = {"type": kind, "field": field}
+        if kind == "votes":
+            op["choices"] = [c.strip() for c in ask("    the options / candidates", "Alice, Bob, Carol").split(",") if c.strip()]
+        if kind != "difference":
+            op["select"] = pick("    which records should the role's action use?", [
+                ("all", "always ALL records (no question asked)"),
+                ("ids", "the role types a list of IDs"),
+                ("filter", "the role types a value for a FIXED field filter (e.g. Department = HR)"),
+                ("ask", "let the role choose each time (all / IDs / filter menu)")], 2)
+            if op["select"] == "filter":
+                op["filter_field"] = pick("      filter on which field?",
+                                          [(l, l) for l in candidates if l != field] or [(field, field)], 1)
+                op["filter_method"] = pick("      through which index?", [("plain", "plain index (stored in clear)"),
+                                                                         ("sse", "SSE (HMAC tokens)"),
+                                                                         ("pkse", "PKSE (Paillier)")], 1)
+        ops.append(op)
+        print("    added:", HE_TYPES[kind], "of", field, "--", {"all": "all records", "ids": "typed IDs",
+              "ask": "menu at run time", None: "two IDs"}.get(op.get("select"), "filter by " + str(op.get("filter_field"))))
+    cfg["he"] = ops
+    if any(OPS[op["type"]][0] == "p" for op in ops):
+        cfg["trustees"] = ask_num("  threshold decryption: number of trustees (0 = no)", 0)
+
+    s_type = pick("Search (a plain index is always included; add lab 8 encrypted search?):",
+                  [("none", "no search menu"), ("plain", "plain index only"), ("sse", "plain + SSE"),
+                   ("pkse", "plain + PKSE"), ("both", "plain + SSE + PKSE")], 5)
+    if s_type != "none":
+        labels = [f["label"] for f in fields if f["kind"] != "file"]
+        chosen = ask_fields("  search by which field(s)", labels)
+        cfg["search"] = {"types": {"plain": [], "sse": ["sse"], "pkse": ["pkse"], "both": ["sse", "pkse"]}[s_type],
+                         "fields": chosen,
+                         "time": yes("  also search by time range?")}
+
+    if yes("Must the timestamp be inside a time window (deadline / voting period)?"):
+        cfg["window"] = ask("  call it", "voting period")
+
+    if yes("Role-based (RBAC) menus?", "y"):
+        names = [r.strip() for r in ask("  role names, comma separated", "Patient, Doctor, Auditor").split(",") if r.strip()]
+        tmp = normalize(json.loads(json.dumps(dict(cfg, roles=[]))))
+        catalogue = tmp["roles"][0][1]
+        labels = action_labels(tmp)
+        print("  Actions:")
+        for i, a in enumerate(catalogue, start=1):
+            print("    %d) %s" % (i, labels[a]))
+        roles = []
+        for name in names:
+            chosen = ask("  numbers for %s (e.g. 1,2)" % name, "1")
+            picked = [catalogue[int(x) - 1] for x in re.findall(r"\d+", chosen) if 1 <= int(x) <= len(catalogue)]
+            roles.append([name, picked])
+        cfg["roles"] = roles
+
+    cfg["persist"] = yes("Keep keys between runs (saved to a keys file on the first run, reused later)?", "y")
+    cfg["decrypted_file"] = yes("Append every decrypted record to a decrypted-records file (history)?", "y")
+    cfg["access_log"] = yes("Keep an access log (who did what, when)?", "y")
+    cfg["show_steps"] = yes("Print every calculation (keys, IV, ciphertexts, data hashed, hash, signature, "
+                            "recomputed hash, encrypted totals)?", "y")
+    cfg["out"] = ask("Output file", "exam_solution.py")
+    return cfg
+
+
+def interview_kx():
+    cfg = {}
+    cfg["name"] = ask("System name", "FieldTrack")
+    cfg["p"] = ask_num("DH prime p", 23)
+    cfg["g"] = ask_num("DH generator g", 5)
+    s = ask("Sender private key (Enter = random)", 6)
+    cfg["sender_private"] = int(s) if s.strip() else None
+    s = ask("Receiver private key (Enter = random)", 15)
+    cfg["receiver_private"] = int(s) if s.strip() else None
+    cfg["cipher"] = pick("Cipher on A-Z text:", [("affine", "affine (k1 typed + validated, k2)"),
+                                                 ("additive", "additive / Caesar (k = K mod 26)"),
+                                                 ("multiplicative", "multiplicative (k1 typed + validated)")], 1)
+    if cfg["cipher"] == "affine":
+        s = ask("k2 given in the question (Enter = use K mod 26)", 2)
+        cfg["k2"] = int(s) if s.strip() else None
+    cfg["out"] = ask("Output file", "fieldtrack.py")
+    return cfg
+
+
+def generate(cfg):
+    kind = cfg.get("_kind", "records")
+    cfg = json.loads(json.dumps({k: v for k, v in cfg.items() if not k.startswith("_")}))    # deep copy
+    return build_kx(cfg) if kind == "kx" else build_records(cfg)
+
+
+def main():
+    args = sys.argv[1:]
+    if "--list" in args:
+        for name, preset in PRESETS.items():
+            print("%-13s %s" % (name, preset["_about"]))
+        return
+
+    if "--preset" in args:
+        name = args[args.index("--preset") + 1]
+        if name not in PRESETS:
+            sys.exit("unknown preset %r; try --list" % name)
+        cfg = dict(PRESETS[name])
+    else:
+        print("=== IS lab exam code generator ===  (Enter accepts the [default])\n")
+        kind = pick("What kind of question?", [
+            ("records", "record system: encrypt + hash + sign + store; verify / decrypt / tally / search per role"),
+            ("kx", "key exchange + classical cipher (Diffie-Hellman -> affine ..., FieldTrack)"),
+            ("preset", "one of the sample questions")], 1)
+        if kind == "preset":
+            name = pick("Which one?", [(n, n + " -- " + p["_about"]) for n, p in PRESETS.items()], 1)
+            cfg = dict(PRESETS[name])
+        elif kind == "kx":
+            cfg = dict(interview_kx(), _kind="kx")
+        else:
+            cfg = interview_records()
+        print("\nAnswers (paste into PRESETS in generate.py to reuse):")
+        print(json.dumps(cfg))
+
+    if "--out" in args:
+        cfg["out"] = args[args.index("--out") + 1]
+    out = cfg.get("out", "exam_solution.py")
+    if not os.path.isabs(out):
+        out = os.path.join(os.getcwd(), out)
+    cfg["out"] = out
+
+    code = generate(cfg)
+    if os.path.exists(out) and "--force" not in args and "--preset" not in args:
+        if not yes("%s exists. Overwrite?" % out):
+            sys.exit("nothing written")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(code)
+    print("\nWrote", out, "(%d lines)" % code.count("\n"))
+
+    if "--no-test" not in args:
+        print("Running its self-test ...")
+        done = subprocess.run([sys.executable, out, "test"], capture_output=True, text=True, timeout=600)
+        tail = (done.stdout + done.stderr).strip().splitlines()[-15:]
+        print("\n".join("   | " + line for line in tail))
+        print("SELF-TEST", "PASSED" if done.returncode == 0 and "SELF-TEST PASSED" in done.stdout else "FAILED")
+        print("Run it:  python", os.path.relpath(out))
+
+
+if __name__ == "__main__":
+    main()

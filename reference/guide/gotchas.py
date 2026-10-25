@@ -184,6 +184,12 @@
 #     string for hashing, printing, or storing in a text file.
 #
 #  HOMOMORPHIC ENCRYPTION (lab 7)
+#   - What each scheme can do (all in generate.py / ciphers/):
+#       Paillier : add ciphertexts, + constant, x constant, subtract (NOT ct x ct)
+#       RSA      : multiply ciphertexts, x constant (Enc(m)*k^e), ^ constant (NOT add)
+#       ElGamal  : multiply ciphertexts, x constant (c2*k), ^ constant (NOT add)
+#       exponential ElGamal (encrypt g^m): add ciphertexts -- small totals only,
+#       decryption searches for m
 #   - Paillier adds, textbook RSA multiplies -- neither does both. Enc(a)*Enc(b)
 #     is the SUM under Paillier but the PRODUCT under textbook RSA, and adding
 #     two RSA ciphertexts gives garbage.
