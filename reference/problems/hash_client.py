@@ -6,17 +6,18 @@ PORT = 65432
 
 
 def custom_hash(data):
-    """djb2-style hash: start at 5381, multiply by 33 and add each
-    character's ASCII value, with an XOR-shift mixing step, masked to
-    32 bits. See ciphers/hash_function.py for the standalone version."""
+    """djb2-style hash: start at 5381, and for each character multiply the
+    running hash by 33 and add the character's ASCII value. An XOR-shift step
+    mixes the bits further, and the result is masked back to 32 bits after
+    every character so it never grows unbounded."""
     hash_value = 5381
 
     for char in data:
         hash_value = (hash_value * 33) + ord(char)
-        hash_value ^= (hash_value >> 13)
-        hash_value &= 0xFFFFFFFF
+        hash_value ^= (hash_value >> 13)      # bitwise mixing
+        hash_value &= 0xFFFFFFFF              # keep to 32 bits
 
-    return hash_value
+    return format(hash_value, "08x")      # hex string, like every hash in hashing.py
 
 
 def send_message(message, tamper=False, host=HOST, port=PORT):
@@ -36,10 +37,10 @@ def send_message(message, tamper=False, host=HOST, port=PORT):
 
         client_socket.sendall(wire_message.encode())
 
-        received_hash = int(client_socket.recv(4096).decode())
+        received_hash = client_socket.recv(4096).decode()
 
-    print(f"[Client] Local hash of original message : {local_hash:#010x}")
-    print(f"[Client] Hash received from server       : {received_hash:#010x}")
+    print(f"[Client] Local hash of original message : {local_hash}")
+    print(f"[Client] Hash received from server       : {received_hash}")
 
     if local_hash == received_hash:
         print("[Client] Integrity check PASSED -- data was not altered")

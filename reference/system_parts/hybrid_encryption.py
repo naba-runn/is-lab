@@ -17,6 +17,7 @@ def aes_encrypt(key, plaintext, iv=None):
     iv = iv or get_random_bytes(AES.block_size)
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     encrypted = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
 
     return (iv + encrypted).hex()
@@ -29,6 +30,7 @@ def aes_decrypt(key, ciphertext):
     iv, encrypted = raw[:AES.block_size], raw[AES.block_size:]
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     decrypted = unpad(cipher.decrypt(encrypted), AES.block_size)
 
     return decrypted.decode()
@@ -37,7 +39,10 @@ def aes_decrypt(key, ciphertext):
 # ---- from ciphers/rsa.py (verbatim) ----
 
 def rsa_generate_keys():
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
     public_key = private_key.public_key()
 
     numbers = private_key.private_numbers()

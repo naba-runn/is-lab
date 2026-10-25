@@ -1,3 +1,11 @@
+# ElGamal digital signature -- SAME interface as every other *_signature.py:
+#
+#   elgamal_sign(message, p, g, x)              -> signature as a STRING "r,s"
+#   elgamal_verify(message, signature, p, g, y)  -> True / False
+#
+# The signature may be that string or the two numbers / a tuple read back from a
+# file -- verify converts it.
+
 import hashlib
 from Crypto.Util.number import getPrime, getRandomRange
 
@@ -27,10 +35,11 @@ def elgamal_sign(message, p, g, x):
     k_inv = pow(k, -1, p - 1)
     s = (k_inv * (h - x * r)) % (p - 1)
 
-    return r, s
+    return str(r) + "," + str(s)
 
 
-def elgamal_verify(message, r, s, p, g, y):
+def elgamal_verify(message, signature, p, g, y):
+    r, s = _split_signature(signature)
     if not (0 < r < p):
         return False
 
@@ -48,13 +57,21 @@ def _egcd(a, b):
     return a
 
 
+def _split_signature(signature):
+    """A signature is the string "a,b"; numbers or a tuple (e.g. read from a file) work too."""
+    if isinstance(signature, str):
+        first, second = signature.split(",")
+        return int(first), int(second)
+    return int(signature[0]), int(signature[1])
+
+
 if __name__ == "__main__":
     p, g, y, x = elgamal_generate_keys()
     message = "Alice"
 
-    r, s = elgamal_sign(message, p, g, x)
+    signature = elgamal_sign(message, p, g, x)
     print("Message   :", message)
-    print("Signature :", (r, s))
-    print("Verified  :", elgamal_verify(message, r, s, p, g, y))
-
-    print("Tampered  :", elgamal_verify("Mallory", r, s, p, g, y))
+    print("Signature :", signature)
+    print("Verified  :", elgamal_verify(message, signature, p, g, y))
+    print("Tampered  :", elgamal_verify("Mallory", signature, p, g, y))
+    print("As a tuple:", elgamal_verify(message, tuple(signature.split(",")), p, g, y))

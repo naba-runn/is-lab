@@ -2,6 +2,22 @@
 #  GOTCHAS  --  the mistakes that cost time
 # =============================================================================
 #
+#  UNIFORM INTERFACES (every file in a family has the same shape)
+#   - hash:      md5_hash / sha1_hash / sha256_hash / sha512_hash / custom_hash
+#                (text) -> hex STRING
+#   - sign:      rsa_sign / elgamal_sign / schnorr_sign / dh_sign
+#                (message, <private key>) -> signature STRING ("123..." or "r,s")
+#   - verify:    rsa_verify / elgamal_verify / schnorr_verify / dh_verify
+#                (message, signature, <public key>) -> True / False
+#                signature may be the string, an int, or a tuple from a file
+#   - encrypt:   (key..., plaintext) -> STRING;  decrypt: (key..., ciphertext) -> STRING
+#   - keys:      *_generate_keys / dh_generate_keypair return PUBLIC part first,
+#                PRIVATE last;  *_demo_key() is a FIXED demo key, not random
+#   - rsa_recover(signature, e, n) is only for the lab's "signature turns back
+#     into ALICE" exercise -- use rsa_verify to check a signature.
+#   - RSA with GIVEN n/e/d numbers: rsa_given_encrypt / rsa_given_decrypt
+#     (own names, so they never clash with rsa_encrypt from rsa.py)
+#
 #  TYPES
 #   - Nearly every cipher file is string-in / string-out. Only
 #     problems/file_transfer.py works on raw bytes.
@@ -116,7 +132,9 @@
 #     that straight into pow(signature, e, n) without converting it back
 #     first and you get:
 #         TypeError: unsupported operand type(s) for ** or pow(): 'str', 'int', 'int'
-#     Fix: signature = int(record[2]) before calling rsa_verify.
+#     (Old problem: every *_verify in ciphers/ now accepts the signature as a
+#     string and converts it itself, so rsa_verify(message, record[2], e, n)
+#     just works. Your OWN pow(...) code still needs int(...).)
 #
 #  SECURITY ORDERING
 #   - Decrypt AFTER checking integrity and authenticity, not before. Calling

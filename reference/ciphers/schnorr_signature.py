@@ -1,3 +1,11 @@
+# Schnorr digital signature -- SAME interface as every other *_signature.py:
+#
+#   schnorr_sign(message, p, q, g, x)              -> signature as a STRING "e,s"
+#   schnorr_verify(message, signature, p, q, g, y)  -> True / False
+#
+# The signature may be that string or the two numbers / a tuple read back from a
+# file -- verify converts it.
+
 import hashlib
 from Crypto.Util.number import getPrime, getRandomRange, isPrime
 
@@ -38,14 +46,23 @@ def schnorr_sign(message, p, q, g, x):
     e = _hash_to_int(r, message, modulus=q)
     s = (k + x * e) % q
 
-    return e, s
+    return str(e) + "," + str(s)
 
 
-def schnorr_verify(message, e, s, p, q, g, y):
+def schnorr_verify(message, signature, p, q, g, y):
+    e, s = _split_signature(signature)
     r_check = (pow(g, s, p) * pow(y, -e, p)) % p
     e_check = _hash_to_int(r_check, message, modulus=q)
 
     return e_check == e
+
+
+def _split_signature(signature):
+    """A signature is the string "a,b"; numbers or a tuple (e.g. read from a file) work too."""
+    if isinstance(signature, str):
+        first, second = signature.split(",")
+        return int(first), int(second)
+    return int(signature[0]), int(signature[1])
 
 
 if __name__ == "__main__":
@@ -53,10 +70,9 @@ if __name__ == "__main__":
     y, x = schnorr_generate_keys(p, q, g)
 
     message = "Alice"
-    e, s = schnorr_sign(message, p, q, g, x)
+    signature = schnorr_sign(message, p, q, g, x)
 
     print("Message   :", message)
-    print("Signature :", (e, s))
-    print("Verified  :", schnorr_verify(message, e, s, p, q, g, y))
-
-    print("Tampered  :", schnorr_verify("Mallory", e, s, p, q, g, y))
+    print("Signature :", signature)
+    print("Verified  :", schnorr_verify(message, signature, p, q, g, y))
+    print("Tampered  :", schnorr_verify("Mallory", signature, p, q, g, y))

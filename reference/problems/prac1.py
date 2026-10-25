@@ -28,14 +28,16 @@ def vigenere_decrypt(cipher, key):
     )
 
 
-def aes_generate_key():
+def aes_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     return "1234567890123456"
 
 
-def aes_encrypt(key, plaintext):
-    iv = get_random_bytes(AES.block_size)
+def aes_encrypt(key, plaintext, iv=None):
+    key_bytes = key.encode() if isinstance(key, str) else key
+    iv = iv or get_random_bytes(AES.block_size)
 
-    cipher = AES.new(key.encode(), AES.MODE_CBC, iv)
+    cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
 
     encrypted = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
 
@@ -43,10 +45,12 @@ def aes_encrypt(key, plaintext):
 
 
 def aes_decrypt(key, ciphertext):
+    key_bytes = key.encode() if isinstance(key, str) else key
+
     raw = bytes.fromhex(ciphertext)
     iv, encrypted = raw[:AES.block_size], raw[AES.block_size:]
 
-    cipher = AES.new(key.encode(), AES.MODE_CBC, iv)
+    cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
 
     decrypted = unpad(cipher.decrypt(encrypted), AES.block_size)
 
@@ -102,7 +106,7 @@ key1 = "dollars"
 c1 = vigenere_encrypt(text, key1)
 
 # 2. AES encrypt the vigenere ciphertext
-key2 = aes_generate_key()
+key2 = aes_demo_key()
 c2 = aes_encrypt(key2, c1)
 
 # 3. RSA encrypt the AES key

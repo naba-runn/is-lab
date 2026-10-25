@@ -1,13 +1,17 @@
+import hashlib
 import socket
 
 HOST = "127.0.0.1"
 PORT = 65433
 
 
-def rsa_verify(signature, e, n):
-    m = pow(signature, e, n)
-    length = (m.bit_length() + 7) // 8
-    return m.to_bytes(length, "big").decode(errors="replace")
+def rsa_message_number(message, n):
+    """What is actually signed: SHA-256 of the message as a number, reduced mod n."""
+    return int.from_bytes(hashlib.sha256(message.encode()).digest(), "big") % n
+
+
+def rsa_verify(message, signature, e, n):
+    return pow(int(signature), e, n) == rsa_message_number(message, n)
 
 
 def receive_and_verify(e, n, host=HOST, port=PORT):
@@ -15,16 +19,12 @@ def receive_and_verify(e, n, host=HOST, port=PORT):
         client_socket.connect((host, port))
 
         payload = client_socket.recv(4096).decode()
-        document, signature = payload.split("|")
-        signature = int(signature)
+        document, signature = payload.split("|")      # signature stays a string -- verify accepts it
 
     print(f"[Client] Received document : {document!r}")
-    print(f"[Client] Received signature: {hex(signature)}")
+    print(f"[Client] Received signature: {signature[:40]}...")
 
-    recovered = rsa_verify(signature, e, n)
-    print(f"[Client] Signature verifies to: {recovered!r}")
-
-    if recovered == document:
+    if rsa_verify(document, signature, e, n):
         print("[Client] Signature is VALID -- document is authentic")
     else:
         print("[Client] Signature is INVALID -- document may be forged/corrupted")

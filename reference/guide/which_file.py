@@ -8,10 +8,20 @@
 #  files/         plain-text and JSON file read / write
 #  problems/      finished example systems (each file is standalone)
 #  guide/         these notes
+#  templates/     the past exam questions as complete, tested programs --
+#                 copy one, edit the lines marked "CHANGE:"
 #  generate.py    asks about the scenario, writes a full runnable solution
 #                 file + runs its self-test (python generate.py --list for the
 #                 sample questions: evoting, employee, securevault,
 #                 healthsecure, hospital, medisecure, grant, fieldtrack)
+#
+# --- templates/ (one file per past exam question; python X.py test) ---------
+#   E-voting: AES-256, RSA-4096 key, SHA-512, ElGamal, Paillier, threshold, SSE   templates/evoting.py
+#   FieldTrack: Diffie-Hellman + affine with k1/k2 checks                         templates/fieldtrack.py
+#   SecureVault: DES-CBC, SHA-256, ElGamal sig; Client/Lawyer/Compliance        templates/securevault.py
+#   HealthSecure: RSA per field, SHA-256, RSA sig; Doctor/Nurse/Admin            templates/healthsecure.py
+#   Hospital: file -> AES-128, AES key RSA-encrypted in a file, ElGamal code     templates/hospital.py
+#   MediSecure: AES typed key + IV, SHA-256, RSA sig; Patient/Doctor/Auditor     templates/medisecure.py
 #
 # --- ciphers/ ----------------------------------------------------------------
 #   Additive / multiplicative / affine cipher          ciphers/primitives.py
@@ -28,7 +38,7 @@
 #   AES-192 showing every round step                    ciphers/aes192_steps.py
 #   AES or DES in ECB / CBC / CFB / OFB / CTR          ciphers/block_modes.py
 #   RSA, generate real keys                            ciphers/rsa.py
-#   RSA, given raw n / e / d numbers                   ciphers/rsa_given_keys.py
+#   RSA, given raw n / e / d numbers                   ciphers/rsa_given_keys.py  (rsa_given_encrypt)
 #   RSA digital signature (Alice/Bob lab)              ciphers/rsa_signature.py
 #   ElGamal encryption (works with given p,g,h,x)      ciphers/elgamal.py
 #   ElGamal signature                                  ciphers/elgamal_signature.py
@@ -46,6 +56,8 @@
 #   Searchable encryption, public-key (Paillier)       ciphers/pkse.py
 #   Custom hash (5381, *33, 32-bit mask)               ciphers/hash_function.py
 #   MD5 / SHA-1 / SHA-256 / SHA-512                    ciphers/hashing.py
+#   (every hash -> hex string; every X_sign -> string; every X_verify -> True/False,
+#    see the UNIFORM INTERFACES section of guide/gotchas.py)
 #   timestamp / normalize key / tamper                 ciphers/glue_snippets.py
 #   str/bytes/hex/int/bits conversions                 ciphers/type_conversions.py
 #

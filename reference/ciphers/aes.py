@@ -3,7 +3,8 @@ from Crypto.Util.Padding import pad, unpad
 from Crypto.Random import get_random_bytes
 
 
-def aes_generate_key():
+def aes_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     return "1234567890123456"
 
 
@@ -32,7 +33,7 @@ def aes_decrypt(key, ciphertext):
 
 
 if __name__ == "__main__":
-    key = aes_generate_key()
+    key = aes_demo_key()
     data = "Hello AES"
 
     encrypted = aes_encrypt(key, data)

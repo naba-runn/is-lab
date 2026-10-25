@@ -3,7 +3,8 @@ import string
 A = string.ascii_lowercase
 
 
-def hill_generate_key():
+def hill_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     return [
         [3, 3],
         [2, 7]
@@ -59,7 +60,7 @@ def hill_decrypt(cipher, K):
 
 
 if __name__ == "__main__":
-    K = hill_generate_key()
+    K = hill_demo_key()
     text = "We live in an insecure world"
 
     cipher = hill_encrypt(text, K)

@@ -3,7 +3,8 @@ from Crypto.Util.Padding import pad, unpad
 from Crypto.Random import get_random_bytes
 
 
-def aes256_generate_key():
+def aes256_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     # 64 hex chars = 32 bytes -> AES-256
     return "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
 
@@ -34,7 +35,7 @@ def aes256_decrypt(key_hex, ciphertext):
 
 
 if __name__ == "__main__":
-    key = aes256_generate_key()
+    key = aes256_demo_key()
     message = "Encryption Strength"
 
     ciphertext = aes256_encrypt(key, message)

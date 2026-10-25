@@ -232,7 +232,8 @@ def aes192_decrypt_block(block, key_bytes, verbose=True):
     return _state_to_bytes(state)
 
 
-def aes192_generate_key():
+def aes192_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     # 32 hex chars = 16 bytes as given in the assignment. AES-192 needs a
     # 24-byte (48 hex char) key, so the given block is extended with one more
     # repetition of itself to reach the required length.
@@ -266,7 +267,7 @@ def aes192_decrypt(key_hex, ciphertext):
 
 
 if __name__ == "__main__":
-    key = aes192_generate_key()
+    key = aes192_demo_key()
     message = "Top Secret Data"
 
     print("Key (hex, 24 bytes) :", key)

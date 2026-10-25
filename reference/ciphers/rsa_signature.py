@@ -1,12 +1,34 @@
+# RSA digital signature -- SAME interface as every other *_signature.py:
+#
+#   rsa_sign(message, d, n)                -> signature as a STRING
+#   rsa_verify(message, signature, e, n)   -> True / False
+#
+# The signature may be passed as that string or as an int (e.g. read back from a
+# text file) -- verify converts it. The SHA-256 of the message is signed, so a
+# message of any length works.
+#
+# rsa_recover() is only for the lab exercise where a signature was made
+# directly on short text ("ALICE") and you must show the text it turns back into.
+
+import hashlib
+
+
+def rsa_message_number(message, n):
+    """What is actually signed: SHA-256 of the message as a number, reduced mod n."""
+    return int.from_bytes(hashlib.sha256(message.encode()).digest(), "big") % n
+
+
 def rsa_sign(message, d, n):
-    m = int.from_bytes(message.encode(), "big")
-    signature = pow(m, d, n)
-
-    return signature
+    return str(pow(rsa_message_number(message, n), d, n))
 
 
-def rsa_verify(signature, e, n):
-    m = pow(signature, e, n)
+def rsa_verify(message, signature, e, n):
+    return pow(int(signature), e, n) == rsa_message_number(message, n)
+
+
+def rsa_recover(signature, e, n):
+    """Textbook check from the lab: signature^e mod n turned back into text."""
+    m = pow(int(signature), e, n)
     length = (m.bit_length() + 7) // 8
 
     return m.to_bytes(length, "big").decode(errors="replace")
@@ -41,13 +63,14 @@ if __name__ == "__main__":
     """
     alice_signature = int("".join(alice_signature_hex.split()), 16)
 
-    # Step 2: Bob verifies Alice's signature
-    recovered = rsa_verify(alice_signature, e, n)
-    print("Alice's signature verifies to:", recovered)
+    # Step 2: Bob checks Alice's lab signature (made directly on the text)
+    print("Alice's signature recovers to:", rsa_recover(alice_signature, e, n))
 
-    # Step 3: Bob signs his own response
+    # Step 3: Bob signs his own response (SHA-256 of the message is signed)
     bob_signature = rsa_sign("BOB", d, n)
-    print("Bob's computed signature      :", hex(bob_signature))
+    print("Bob's signature              :", bob_signature[:40] + "...")
 
-    # Step 4: Alice verifies Bob's signature
-    print("Bob's signature verifies to   :", rsa_verify(bob_signature, e, n))
+    # Step 4: Alice verifies Bob's signature -- True / False like every verify
+    print("Bob's signature valid        :", rsa_verify("BOB", bob_signature, e, n))
+    print("valid for 'BOB!' (tampered)  :", rsa_verify("BOB!", bob_signature, e, n))
+    print("valid when read from a file  :", rsa_verify("BOB", str(bob_signature), e, n))

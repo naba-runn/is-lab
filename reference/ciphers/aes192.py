@@ -3,7 +3,8 @@ from Crypto.Util.Padding import pad, unpad
 from Crypto.Random import get_random_bytes
 
 
-def aes192_generate_key():
+def aes192_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     # 48 hex chars = 24 bytes -> AES-192
     return "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
 
@@ -34,7 +35,7 @@ def aes192_decrypt(key_hex, ciphertext):
 
 
 if __name__ == "__main__":
-    key = aes192_generate_key()
+    key = aes192_demo_key()
     message = "Top Secret Data"
 
     ciphertext = aes192_encrypt(key, message)

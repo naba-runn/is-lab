@@ -2,7 +2,8 @@ from Crypto.Cipher import DES
 from Crypto.Util.Padding import pad, unpad
 
 
-def tripledes_generate_key():
+def tripledes_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     # 48 hex chars = 24 bytes -> three 8-byte DES keys K1, K2, K3
     return "1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF"
 
@@ -49,7 +50,7 @@ def tripledes_decrypt(key_hex, ciphertext):
 
 
 if __name__ == "__main__":
-    key = tripledes_generate_key()
+    key = tripledes_demo_key()
     message = "Classified Text"
 
     ciphertext = tripledes_encrypt(key, message)

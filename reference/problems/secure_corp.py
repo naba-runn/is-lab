@@ -2,14 +2,17 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from Crypto.Util.number import getPrime, getRandomRange
 from Crypto.Random import get_random_bytes
-from cryptography.hazmat.primitives.asymmetric import rsa as rsa_lib, padding
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes
 
 
 # ---- from ciphers/rsa.py (verbatim) ----
 
 def rsa_generate_keys():
-    private_key = rsa_lib.generate_private_key(public_exponent=65537, key_size=2048)
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
     public_key = private_key.public_key()
 
     numbers = private_key.private_numbers()
@@ -60,7 +63,7 @@ def dh_generate_keypair(p, g):
     private_key = getRandomRange(2, p - 1)
     public_key = pow(g, private_key, p)
 
-    return private_key, public_key
+    return public_key, private_key      # (public, private) like every generator
 
 
 # ---- from ciphers/aes.py (verbatim) ----
@@ -70,6 +73,7 @@ def aes_encrypt(key, plaintext, iv=None):
     iv = iv or get_random_bytes(AES.block_size)
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     encrypted = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
 
     return (iv + encrypted).hex()
@@ -82,6 +86,7 @@ def aes_decrypt(key, ciphertext):
     iv, encrypted = raw[:AES.block_size], raw[AES.block_size:]
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     decrypted = unpad(cipher.decrypt(encrypted), AES.block_size)
 
     return decrypted.decode()
@@ -104,7 +109,7 @@ class KeyManager:
 
     def register(self, name):
         rsa_private, rsa_public, _, _, _ = rsa_generate_keys()
-        dh_private, dh_public = dh_generate_keypair(self.dh_p, self.dh_g)
+        dh_public, dh_private = dh_generate_keypair(self.dh_p, self.dh_g)
 
         self.subsystems[name] = {
             "rsa_private": rsa_private,

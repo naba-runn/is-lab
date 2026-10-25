@@ -21,6 +21,13 @@
 #   - search: plain index (in clear) or SSE / PKSE; shows the COMPLETE record
 #   - homomorphic SUM / AVERAGE / PRODUCT / vote count, each its own menu
 #     action, over all records, chosen IDs, or a field filter via an index
+#   - optional extras (all off unless you say yes):
+#       login (username + password, salted PBKDF2) before each role menu
+#       a password per record (key = PBKDF2(password, salt); only salt + check stored)
+#       a different algorithm for chosen fields (e.g. Diagnosis with RSA)
+#       every signer has their OWN key pair, plus a "Countersign" action
+#       a decryption time window (decrypt only between two times)
+#       socket mode:  python <file> server  /  python <file> client
 #   - runs every menu action by itself with:   python <file> test
 #   - marks the numbers/names you should copy from the question with  TODO
 #
@@ -216,6 +223,8 @@ def action_labels(cfg):
         "report": "Generate compliance report (no decryption)",
         "search": "Search " + noun + "s (" + " / ".join(m if m != "plain" else "plain index" for m in cfg["methods"]) + ")",
         "search_time": "Search by time range",
+        "cosign": "Countersign a " + noun + " (with YOUR own key)",
+        "show_keys": "Show every user's public key",
     }
     for op in cfg["he"]:
         labels[op["action"]] = OPS[op["type"]][2] % op["label"] + {
@@ -232,7 +241,7 @@ DEFAULTS = {
     "id_label": "Record ID",
     "fields": "Name, Details",
     "enc": "aes256",
-    "key_src": "random",          # random | typed_once | typed_each   ("wrap" = old name for wrap: record)
+    "key_src": "random",          # random | typed_once | typed_each | password   ("wrap" = old name for wrap: record)
     "wrap": "none",               # RSA-encrypt the AES/DES key: none | record (fresh key per record) | file
     "iv_src": "random",           # random | typed
     "rsa_bits": 2048,
@@ -250,6 +259,12 @@ DEFAULTS = {
     "persist": True,              # save keys to <name>_keys.txt on the first run, reuse them on later runs
     "decrypted_file": True,       # append every successful decryption to <name>_decrypted.txt
     "access_log": True,           # write <name>_access_log.txt
+    "login": False,               # username + password (salted PBKDF2) before a role menu can be used
+    "field_enc": {},              # {field label: algorithm} -> that field gets its OWN ciphertext
+    "user_keys": False,           # every signer has their OWN key pair; the record stores who signed
+    "cosign": False,              # adds a "Countersign" action: a second signature by another user
+    "sockets": False,             # the same file also runs as  python file.py server / client
+    "decrypt_window": None,       # label, e.g. "exam window" -> decryption only allowed inside it
 }
 
 
@@ -269,6 +284,11 @@ def normalize(cfg):
     cfg["fields"] = parse_fields(cfg["fields"]) if isinstance(cfg["fields"], str) else cfg["fields"]
     if cfg["key_src"] == "wrap":
         cfg["wrap"] = "record"
+    if cfg["key_src"] == "password":
+        cfg["wrap"] = "none"                      # the key comes from each record's password
+        if cfg["hash_over"] == "plaintext":
+            print("note: hash of the plaintext would need every password to verify -> hash of the ciphertext")
+            cfg["hash_over"] = "ciphertext"
     if cfg["enc"] not in SYMMETRIC:
         cfg["wrap"] = "none"
     if cfg["wrap"] == "record":
@@ -282,6 +302,20 @@ def normalize(cfg):
     if cfg["hash_over"] == "plaintext" and cfg["key_src"] == "typed_each":
         print("note: hash of the plaintext needs the key to verify -> key typed once at start instead")
         cfg["key_src"] = "typed_once"
+
+    # fields with their own algorithm
+    cfg["fenc"] = []
+    for label, alg in (cfg["field_enc"] or {}).items():
+        f = field_by_label(cfg, label)
+        if alg not in SYMMETRIC and alg not in ASYMMETRIC:
+            sys.exit("generate.py: unknown algorithm %r for field %s" % (alg, label))
+        cfg["fenc"].append({"label": f["label"], "var": f["var"], "alg": alg})
+    if cfg["cosign"]:
+        cfg["user_keys"] = True
+    if cfg["user_keys"] and cfg["sig"] == "none":
+        cfg["sig"] = "rsa"
+    if cfg["sockets"]:
+        cfg["persist"] = True                     # client and server must share the keys file
 
     # homomorphic operations: one menu action each
     ops = cfg["he"] or []
@@ -330,7 +364,8 @@ def normalize(cfg):
     cfg["time_methods"] = ["plain"] + (["SSE"] if "sse" in index_types else [])
 
     # which actions exist, which roles get them
-    all_actions = BASE_ACTIONS + [op["action"] for op in ops]
+    all_actions = BASE_ACTIONS + (["cosign"] if cfg["cosign"] else []) + (["show_keys"] if cfg["user_keys"] else []) \
+        + [op["action"] for op in ops]
     if not search:
         all_actions = [a for a in all_actions if a not in ("search", "search_time")]
     elif not search["time"]:
@@ -544,7 +579,15 @@ def build_records(cfg):
     wrap = cfg["key_src"] == "wrap"
     wrap_file = cfg["wrap"] == "file"
     persist = cfg["persist"]
-    need_rsa = enc == "rsa" or wrap or wrap_file or cfg["sig"] == "rsa"
+    fenc = cfg["fenc"]
+    falgs = set(f["alg"] for f in fenc)
+    password = cfg["key_src"] == "password"
+    login = cfg["login"]
+    user_keys = cfg["user_keys"]
+    cosign = cfg["cosign"]
+    sockets = cfg["sockets"]
+    dwin = cfg["decrypt_window"]
+    need_rsa = enc == "rsa" or wrap or wrap_file or cfg["sig"] == "rsa" or "rsa" in falgs
     ops = cfg["he"]
     search = cfg["search"]
     types = cfg["index_types"]
@@ -561,25 +604,38 @@ def build_records(cfg):
     stored = ["id", "enc"]
     if wrap:
         stored.append("key")
+    if password:
+        stored += ["salt", "pwcheck"]
+    stored += ["f_" + f["var"] for f in fenc]
     if cfg["extra"]:
         stored.append("extra")
     for op in ops:
         if op["store"] not in stored:
             stored.append(op["store"])
-    stored += ["time", "hash"]
+    stored += ["time"] + (["signer"] if user_keys else []) + ["hash"]
     if sig != "none":
         stored.append("sig")
+    if cosign:
+        stored.append("cosigs")
+    main_fields = [f for f in fields if f["var"] not in [x["var"] for x in fenc]]
 
     enc_name = SYMMETRIC[enc][0] if sym else ASYMMETRIC[enc]
     sym_name = enc_name.split("-CBC")[0]
     desc = {"id": cfg["id_label"] + " (plain, used to look records up)",
-            "enc": enc_name + " of: " + ", ".join(f["label"] for f in fields),
+            "enc": enc_name + " of: " + (", ".join(f["label"] for f in main_fields) or "(nothing -- every field has its own)"),
             "key": "the per-record " + sym_name + " key, RSA-%d encrypted" % cfg["rsa_bits"],
             "extra": "ElGamal encryption of the " + (cfg["extra"]["label"] if cfg["extra"] else ""),
             "votes": "Paillier encryptions of a 0/1 per option (one-hot ballot)",
             "time": "timestamp YYYY-MM-DD HH:MM:SS",
             "hash": HASHES[cfg["hash"]] + " of the " + ("plaintext" if cfg["hash_over"] == "plaintext" else "id + ciphertexts + time"),
-            "sig": SIGNATURES[sig] + " of hash|time"}
+            "sig": SIGNATURES[sig] + " of hash|time" + (" with the SIGNER's own key" if user_keys else ""),
+            "salt": "random salt for this record's password (PBKDF2)",
+            "pwcheck": "check value of the password-derived key (the password is never stored)",
+            "signer": "who signed (their own key pair verifies it)",
+            "cosigs": "countersignatures  name:signature;name:signature  (over a hash of hash|time|sig)"}
+    for f in fenc:
+        alg_name = SYMMETRIC[f["alg"]][0] if f["alg"] in SYMMETRIC else ASYMMETRIC[f["alg"]]
+        desc["f_" + f["var"]] = alg_name + " of " + f["label"] + " (its own algorithm)"
     scheme_desc = {"p": "Paillier encryption of %s (adds)", "m": "textbook-RSA encryption of %s (multiplies)",
                    "e": "ElGamal (c1,c2) of %s (multiplies)", "x": "exponential-ElGamal (c1,c2) of g^%s (adds)"}
     for op in ops:
@@ -609,11 +665,25 @@ def build_records(cfg):
         header.append("# it back and recovers the key with the RSA private key.")
     if cfg["decrypted_file"] and "decrypt" in cfg["used"]:
         header.append("# Every successful decryption is appended to %s_decrypted.txt (history)." % prefix)
+    if login:
+        header.append("# Every role menu starts with a username + password login (salted PBKDF2 in %s_users.txt)." % prefix)
+    if password:
+        header.append("# Each record has its OWN password: key = PBKDF2(password, salt); only salt + check are stored.")
+    if user_keys:
+        header.append("# Every signer has their OWN key pair (%s_signer_keys.txt); verification uses the signer's key." % prefix)
+    if dwin:
+        header.append("# Decryption is only allowed inside the %s (set at start-up)." % dwin)
+    if sockets:
+        header.append("# Socket mode: run 'python %s server' in one terminal and 'python %s client' in"
+                      % (os.path.basename(cfg["out"]), os.path.basename(cfg["out"])))
+        header.append("# another; the server verifies every record it receives and replies ACK / REJECTED.")
     header += ["# SHOW_STEPS = True prints every value computed (keys, ciphertexts, hashes, ...).",
                "# Lines marked TODO hold names/numbers to copy from the question.",
                "#",
                "# Run:  python %s         (menu)" % os.path.basename(cfg["out"]),
                "#       python %s test    (runs every action with typed-in answers)" % os.path.basename(cfg["out"])]
+    if sockets:
+        header += ["#       python %s server  /  python %s client" % (os.path.basename(cfg["out"]), os.path.basename(cfg["out"]))]
 
     # ---------------- constants ----------------
     index_files = []
@@ -628,6 +698,10 @@ def build_records(cfg):
         consts.append('DECRYPTED_FILE = os.path.join(HERE, "%s_decrypted.txt")' % prefix)
     if "report" in cfg["used"]:
         consts.append('REPORT_FILE = os.path.join(HERE, "%s_report.txt")' % prefix)
+    if login:
+        consts.append('USERS_FILE = os.path.join(HERE, "%s_users.txt")' % prefix)
+    if user_keys and persist:
+        consts.append('SIGNER_KEYS_FILE = os.path.join(HERE, "%s_signer_keys.txt")' % prefix)
     if index_fields:
         index_files.append("PLAIN_INDEX_FILE")
         consts.append('PLAIN_INDEX_FILE = os.path.join(HERE, "%s_plain_index.txt")' % prefix)
@@ -650,6 +724,10 @@ def build_records(cfg):
         consts.append("SEARCH_METHODS = %s" % json.dumps(cfg["methods"]))
     if "search_time" in cfg["used"]:
         consts.append("TIME_METHODS = %s" % json.dumps(cfg["time_methods"]))
+    if login or user_keys:
+        consts.append('CURRENT_USER = "-"  # the user logged in / signing')
+    if sockets:
+        consts += ['HOST = "127.0.0.1"', "PORT = 5000"]
     consts += ['ROLE = "-"          # the role currently logged in (written to the access log)',
                "SHOW_STEPS = %s   # chosen in generate.py: print every value computed" % bool(cfg["show_steps"])]
     prog.add("\n".join(consts), "import os", "import sys")
@@ -660,12 +738,14 @@ def build_records(cfg):
     if (sym and cfg["key_src"] in ("typed_once", "typed_each")) or cfg["iv_src"] == "typed":
         prog.use("glue_snippets.py", "normalize_bytes")
     if sig == "elgamal":
-        prog.use("elgamal_signature.py", "_hash_to_int", "elgamal_generate_keys", "elgamal_sign", "elgamal_verify", "_egcd")
+        prog.use("elgamal_signature.py", "_hash_to_int", "elgamal_generate_keys", "elgamal_sign", "elgamal_verify", "_egcd",
+                 "_split_signature")
     if sig == "schnorr":
         prog.use("schnorr_signature.py", "_hash_to_int", "schnorr_generate_domain_parameters",
-                 "schnorr_generate_keys", "schnorr_sign", "schnorr_verify")
+                 "schnorr_generate_keys", "schnorr_sign", "schnorr_verify", "_split_signature")
     if sig == "dsa":
-        prog.use("dh_signature.py", "_hash_to_int", "dh_generate_domain_parameters", "dh_generate_keys", "dh_sign", "dh_verify")
+        prog.use("dh_signature.py", "_hash_to_int", "dh_generate_domain_parameters", "dh_generate_keys", "dh_sign", "dh_verify",
+                 "_split_signature")
     if enc in ("aes128", "aes192", "aes256") or "sse" in types:
         prog.use("aes.py", "aes_encrypt", "aes_decrypt")
     if enc == "des":
@@ -679,7 +759,7 @@ def build_records(cfg):
             patch = ("key_size=2048", "key_size=%d     # RSA-%d as the question asks" % (cfg["rsa_bits"], cfg["rsa_bits"]))
         prog.use("rsa.py", *names, patch=patch)
     if sig == "rsa":
-        prog.use("rsa_signature.py", "rsa_sign", "rsa_verify")
+        prog.use("rsa_signature.py", "rsa_message_number", "rsa_sign", "rsa_verify")
     if enc == "elgamal" or cfg["extra"]:
         names = ["elgamal_encrypt", "elgamal_decrypt"]
         if (enc == "elgamal" and not cfg["elgamal_given"]) or (cfg["extra"] and not cfg["extra"].get("given")):
@@ -711,6 +791,31 @@ def build_records(cfg):
     if "pkse" in types:
         prog.use("pkse.py", "_word_number", "_text_to_number", "_number_to_text")
         prog.need("from Crypto.Util.number import getRandomRange")
+
+    for alg in sorted(falgs):
+        if alg in ("aes128", "aes192", "aes256"):
+            prog.use("aes.py", "aes_encrypt", "aes_decrypt")
+        elif alg == "des":
+            prog.use("block_modes.py", "ALGORITHMS", "PADDED_MODES", "_to_bytes", "_new_cipher", "block_encrypt", "block_decrypt")
+        elif alg == "3des":
+            prog.use("tripledes.py", "_split_key", "_ede_encrypt_block", "_ede_decrypt_block", "tripledes_encrypt",
+                     "tripledes_decrypt")
+        elif alg == "rsa":
+            prog.use("rsa.py", "rsa_encrypt", "rsa_decrypt")
+        elif alg == "elgamal":
+            prog.use("elgamal.py", "elgamal_generate_keys", "elgamal_encrypt", "elgamal_decrypt")
+        elif alg == "ecc":
+            prog.use("ecc.py", "ecc_generate_keys", "derive_shared_key", "ecc_encrypt", "ecc_decrypt")
+        elif alg == "rabin":
+            prog.use("rabin.py", "_prime_3_mod_4", "rabin_generate_keys", "rabin_encrypt", "rabin_decrypt")
+        if alg in SYMMETRIC:
+            prog.need("from Crypto.Random import get_random_bytes")
+    if password or login:
+        prog.need("import hashlib")
+    if login:
+        prog.need("import hmac")
+    if sockets:
+        prog.need("import socket")
 
     # ---------------- show every calculation ----------------
     prog.add(block(r'''
@@ -754,6 +859,8 @@ def build_records(cfg):
     # ---------------- keys ----------------
     setup = ["# ---------- keys: generated ONCE at start-up ----------", "",
              "K = {}", "", "", "def setup_keys():"]
+    if user_keys and persist:
+        setup.append("    load_user_keys()                  # every signer's own key pair (kept between runs)")
     if persist:
         setup += ["    if os.path.exists(KEYS_FILE):",
                   "        load_keys()",
@@ -828,6 +935,27 @@ def build_records(cfg):
                   '    K["start"] = ask_time("  start (YYYY-MM-DD HH:MM): ", now.strftime("%Y-%m-%d %H:%M"))',
                   '    K["end"] = ask_time("  end   (YYYY-MM-DD HH:MM): ", (now + timedelta(days=1)).strftime("%Y-%m-%d %H:%M"))',
                   '    print("%s:", K["start"], "to", K["end"])' % w]
+    for f in fenc:
+        if f["alg"] in SYMMETRIC:
+            setup.append('    K["fk_%s"] = get_random_bytes(%d)          # own key for the %s field'
+                         % (f["var"], SYMMETRIC[f["alg"]][1], f["label"]))
+            setup.append('    print("%s key for %s (hex):", K["fk_%s"].hex())' % (SYMMETRIC[f["alg"]][0].split("-CBC")[0],
+                                                                                  f["label"], f["var"]))
+    if "elgamal" in falgs and enc != "elgamal":
+        setup.append('    K["el_p"], K["el_g"], K["el_h"], K["el_x"] = elgamal_generate_keys()')
+        setup.append('    print("ElGamal public key: p =", K["el_p"], " g =", K["el_g"], " h =", K["el_h"])')
+    if "ecc" in falgs and enc != "ecc":
+        setup.append('    K["ecc_priv"], K["ecc_pub"] = ecc_generate_keys()')
+    if "rabin" in falgs and enc != "rabin":
+        setup.append('    K["rabin_n"], (K["rabin_p"], K["rabin_q"]) = rabin_generate_keys()')
+        setup.append('    print("Rabin public key n =", K["rabin_n"])')
+    if dwin:
+        w = dwin[0].upper() + dwin[1:]
+        setup += ['    now = datetime.now()',
+                  '    print("%s -- decryption allowed only inside it (Enter: from now, for 24 hours)")' % w,
+                  '    K["dstart"] = ask_time("  start (YYYY-MM-DD HH:MM): ", now.strftime("%Y-%m-%d %H:%M"))',
+                  '    K["dend"] = ask_time("  end   (YYYY-MM-DD HH:MM): ", (now + timedelta(days=1)).strftime("%Y-%m-%d %H:%M"))',
+                  '    print("%s:", K["dstart"], "to", K["dend"])' % w]
     if wrap_file:
         setup += ['    wrapped = rsa_encrypt(K["rsa_pub"], K["sym"].hex())',
                   '    with open(WRAPPED_KEY_FILE, "w", encoding="utf-8") as f:',
@@ -910,7 +1038,11 @@ def build_records(cfg):
         key_line = {"random": 'key = K["sym"]',
                     "wrap": 'key = get_random_bytes(%d)                  # fresh key for every record' % size,
                     "typed_once": 'key = K["sym"]',
-                    "typed_each": 'key = normalize_bytes(input("%s key (any text): "), %d)' % (sym_name, size)}[cfg["key_src"]]
+                    "typed_each": 'key = normalize_bytes(input("%s key (any text): "), %d)' % (sym_name, size),
+                    "password": 'password = input("Password for this record: ")\n'
+                                '    salt = os.urandom(16)\n'
+                                '    step("random salt (stored in the record)", salt.hex())\n'
+                                '    key = password_key(password, salt, %d)              # PBKDF2' % size}[cfg["key_src"]]
         z.append("    " + key_line)
         z.append('    step("%s key (hex)", key.hex())' % sym_name)
         iv_size = 8 if enc == "des" else 16
@@ -926,6 +1058,10 @@ def build_records(cfg):
             z.append('    step("IV (hex) = first %d hex chars of the ciphertext", ciphertext[:%d])' % (iv_size * 2, iv_size * 2))
         z.append('    step("%s ciphertext (hex)", ciphertext)' % enc_name)
         z.append('    fields = {"enc": ciphertext}')
+        if password:
+            z += ['    fields["salt"] = salt.hex()',
+                  '    fields["pwcheck"] = password_check(key)',
+                  '    step("password check value (stored instead of the password)", fields["pwcheck"])']
         if wrap:
             z.append('    fields["key"] = rsa_encrypt(K["rsa_pub"], key.hex())    # RSA-wrapped key')
             z.append('    step("%s key encrypted with the RSA public key", fields["key"])' % sym_name)
@@ -942,7 +1078,11 @@ def build_records(cfg):
         key_line = {"random": 'key = K["sym"]',
                     "wrap": 'key = bytes.fromhex(rsa_decrypt(K["rsa_priv"], rec["key"]))    # unwrap the key first',
                     "typed_once": 'key = K["sym"]',
-                    "typed_each": 'key = normalize_bytes(input("%s key (any text): "), %d)' % (sym_name, size)}[cfg["key_src"]]
+                    "typed_each": 'key = normalize_bytes(input("%s key (any text): "), %d)' % (sym_name, size),
+                    "password": 'password = input("Password for this record: ")\n'
+                                '    key = password_key(password, bytes.fromhex(rec["salt"]), %d)\n'
+                                '    if password_check(key) != rec["pwcheck"]:\n'
+                                '        raise ValueError("wrong password for this record")' % size}[cfg["key_src"]]
         if wrap_file:
             z += ['    with open(WRAPPED_KEY_FILE, "r", encoding="utf-8") as f:',
                   "        wrapped = f.read().strip()",
@@ -972,33 +1112,135 @@ def build_records(cfg):
               "def decrypt_extra(ciphertext):",
               '    return elgamal_decrypt(K["ex_p"], K["ex_x"], ciphertext)', "", ""]
 
+    if password:
+        z += ["def password_key(password, salt, size):",
+              '    """PBKDF2-HMAC-SHA256: password + salt -> a key of `size` bytes. The password is never stored."""',
+              '    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000, dklen=size)', "", "",
+              "def password_check(key):",
+              '    """Stored instead of the password: a wrong password is detected BEFORE decrypting."""',
+              '    return hashlib.sha256(b"check" + key).hexdigest()', "", ""]
+    field_calls = {
+        "aes128": ('aes_encrypt(K["fk_{v}"], text)', 'aes_decrypt(K["fk_{v}"], ciphertext)'),
+        "aes192": ('aes_encrypt(K["fk_{v}"], text)', 'aes_decrypt(K["fk_{v}"], ciphertext)'),
+        "aes256": ('aes_encrypt(K["fk_{v}"], text)', 'aes_decrypt(K["fk_{v}"], ciphertext)'),
+        "des": ('block_encrypt("des", "cbc", K["fk_{v}"], text)', 'block_decrypt("des", "cbc", K["fk_{v}"], ciphertext)'),
+        "3des": ('tripledes_encrypt(K["fk_{v}"].hex(), text)', 'tripledes_decrypt(K["fk_{v}"].hex(), ciphertext)'),
+        "rsa": ('rsa_encrypt(K["rsa_pub"], text)', 'rsa_decrypt(K["rsa_priv"], ciphertext)'),
+        "elgamal": ('elgamal_encrypt(K["el_p"], K["el_g"], K["el_h"], text)', 'elgamal_decrypt(K["el_p"], K["el_x"], ciphertext)'),
+        "ecc": ('ecc_encrypt(K["ecc_pub"], text)', 'ecc_decrypt(K["ecc_priv"], ciphertext)'),
+        "rabin": ('rabin_encrypt(K["rabin_n"], text)', 'rabin_decrypt(K["rabin_n"], K["rabin_p"], K["rabin_q"], ciphertext)')}
+    for f in fenc:
+        e_call, d_call = field_calls[f["alg"]]
+        alg_name = SYMMETRIC[f["alg"]][0] if f["alg"] in SYMMETRIC else ASYMMETRIC[f["alg"]]
+        z += ["def encrypt_field_%s(text):" % f["var"],
+              '    """The %s field has its OWN algorithm: %s."""' % (f["label"], alg_name),
+              "    ciphertext = " + e_call.replace("{v}", f["var"]),
+              '    step("%s ciphertext of %s", ciphertext)' % (alg_name, f["label"]),
+              "    return ciphertext", "", "",
+              "def decrypt_field_%s(ciphertext, show=True):" % f["var"],
+              "    text = " + d_call.replace("{v}", f["var"]),
+              "    if show:",
+              '        step("%s decrypted (%s)", text)' % (f["label"], alg_name),
+              "    return text", "", ""]
+    if fenc:
+        z += ["def decrypt_all(rec, show=True):",
+              '    """The main ciphertext plus every separately encrypted field, as one text."""',
+              "    parts = [decrypt_data(rec, show)]        # always included, so the hash covers every ciphertext"]
+        for f in fenc:
+            z.append('    parts.append(%s + decrypt_field_%s(rec["f_%s"], show))' % (q(f["label"] + ": "), f["var"], f["var"]))
+        z += ['    return "\\n".join(parts)', "", ""]
+
     z += ["def hash_fn(text):", "    return %s_hash(text)" % cfg["hash"], "", ""]
 
     if sig != "none":
-        z.append("def sign(message):")
+        sign_call = {"rsa": 'rsa_sign(message, K["rsa_d"], K["rsa_n"])',
+                     "elgamal": 'elgamal_sign(message, K["sg_p"], K["sg_g"], K["sg_x"])',
+                     "schnorr": 'schnorr_sign(message, K["sc_p"], K["sc_q"], K["sc_g"], K["sc_x"])',
+                     "dsa": 'dh_sign(message, K["ds_p"], K["ds_q"], K["ds_g"], K["ds_x"])'}[sig]
+        verify_call = {"rsa": 'rsa_verify(message, signature, K["rsa_e"], K["rsa_n"])',
+                       "elgamal": 'elgamal_verify(message, signature, K["sg_p"], K["sg_g"], K["sg_y"])',
+                       "schnorr": 'schnorr_verify(message, signature, K["sc_p"], K["sc_q"], K["sc_g"], K["sc_y"])',
+                       "dsa": 'dh_verify(message, signature, K["ds_p"], K["ds_q"], K["ds_g"], K["ds_y"])'}[sig]
+        z += ["def sign(message):", "    return " + sign_call, "", "",
+              "def verify_sig(signature, message, show=False):"]
         if sig == "rsa":
-            z.append('    return str(rsa_sign(message, K["rsa_d"], K["rsa_n"]))')
-        elif sig == "elgamal":
-            z += ['    r, s = elgamal_sign(message, K["sg_p"], K["sg_g"], K["sg_x"])', '    return str(r) + "," + str(s)']
-        elif sig == "schnorr":
-            z += ['    e, s = schnorr_sign(message, K["sc_p"], K["sc_q"], K["sc_g"], K["sc_x"])', '    return str(e) + "," + str(s)']
+            z += ["    if show:",
+                  '        step("signature^e mod n (with the public key)", pow(int(signature), K["rsa_e"], K["rsa_n"]))',
+                  '        step("SHA-256 of the message mod n (must be equal)", rsa_message_number(message, K["rsa_n"]))']
+        z += ["    return " + verify_call, "", ""]
+
+    if user_keys:
+        new_keys = {"rsa": ["    _, _, n, e, d = rsa_generate_keys()", "    return [n, e, d]"],
+                    "elgamal": ["    return list(elgamal_generate_keys())                 # [p, g, y, x]"],
+                    "schnorr": ["    p, q, g = schnorr_generate_domain_parameters()",
+                                "    y, x = schnorr_generate_keys(p, q, g)", "    return [p, q, g, y, x]"],
+                    "dsa": ["    p, q, g = dh_generate_domain_parameters()",
+                            "    y, x = dh_generate_keys(p, q, g)", "    return [p, q, g, y, x]"]}[sig]
+        sign_body = {"rsa": ['    return rsa_sign(message, keys[2], keys[0])'],
+                     "elgamal": ['    return elgamal_sign(message, keys[0], keys[1], keys[3])'],
+                     "schnorr": ['    return schnorr_sign(message, keys[0], keys[1], keys[2], keys[4])'],
+                     "dsa": ['    return dh_sign(message, keys[0], keys[1], keys[2], keys[4])']}[sig]
+        verify_body = {"rsa": ["    if show:",
+                               '        step("signature^e mod n (signer\'s public key)", pow(int(signature), keys[1], keys[0]))',
+                               '        step("SHA-256 of the message mod n (must be equal)", rsa_message_number(message, keys[0]))',
+                               "    return rsa_verify(message, signature, keys[1], keys[0])"],
+                       "elgamal": ["    return elgamal_verify(message, signature, keys[0], keys[1], keys[2])"],
+                       "schnorr": ["    return schnorr_verify(message, signature, keys[0], keys[1], keys[2], keys[3])"],
+                       "dsa": ["    return dh_verify(message, signature, keys[0], keys[1], keys[2], keys[3])"]}[sig]
+        public = {"rsa": "keys[:2]          # (n, e)", "elgamal": "keys[:3]          # (p, g, y)",
+                  "schnorr": "keys[:4]          # (p, q, g, y)", "dsa": "keys[:4]          # (p, q, g, y)"}[sig]
+        z += ["# ---------- every signer has their OWN key pair ----------", "",
+              "USER_KEYS = {}      # signer name -> list of ints (their key pair)", "", "",
+              "def new_user_keys():"] + new_keys + ["", "",
+              "def public_part(keys):", "    return " + public, "", "",
+              "def sign_with(keys, message):"] + sign_body + ["", "",
+              "def verify_with(keys, signature, message, show=False):"] + verify_body + ["", ""]
+        if persist:
+            z += ["def save_user_keys():",
+                  '    with open(SIGNER_KEYS_FILE, "w", encoding="utf-8") as f:',
+                  "        for name, keys in USER_KEYS.items():",
+                  '            f.write(name + "|" + ",".join(str(k) for k in keys) + "\\n")', "", "",
+                  "def load_user_keys():",
+                  "    if os.path.exists(SIGNER_KEYS_FILE):",
+                  '        with open(SIGNER_KEYS_FILE, "r", encoding="utf-8") as f:',
+                  "            for line in f:",
+                  '                name, numbers = line.rstrip("\\n").split("|")',
+                  '                USER_KEYS[name] = [int(k) for k in numbers.split(",")]', "", ""]
         else:
-            z += ['    r, s = dh_sign(message, K["ds_p"], K["ds_q"], K["ds_g"], K["ds_x"])', '    return str(r) + "," + str(s)']
-        z += ["", "", "def verify_sig(signature, message, show=False):"]
-        if sig == "rsa":
-            z += ['    recovered = rsa_verify(int(signature), K["rsa_e"], K["rsa_n"])',
-                  "    if show:", '        step("signature^e mod n (with the public key) gives", recovered)',
-                  "    return recovered == message"]
-        elif sig == "elgamal":
-            z += ['    r, s = map(int, signature.split(","))', "    if show:", '        step("ElGamal signature (r, s)", (r, s))',
-                  '    return elgamal_verify(message, r, s, K["sg_p"], K["sg_g"], K["sg_y"])']
-        elif sig == "schnorr":
-            z += ['    e, s = map(int, signature.split(","))', "    if show:", '        step("Schnorr signature (e, s)", (e, s))',
-                  '    return schnorr_verify(message, e, s, K["sc_p"], K["sc_q"], K["sc_g"], K["sc_y"])']
+            z += ["def save_user_keys():", '    """Keys are not kept between runs in this program."""', "    return", "", "",
+                  "def load_user_keys():", "    return", "", ""]
+        z += ["def keys_of(name, create=False):",
+              '    """The key pair of a signer; a new user gets a fresh pair when they first sign."""',
+              "    if name not in USER_KEYS:",
+              "        load_user_keys()                   # another program (e.g. the client) may have added it",
+              "    if name not in USER_KEYS:",
+              "        if not create:",
+              "            return None",
+              "        USER_KEYS[name] = new_user_keys()",
+              "        save_user_keys()",
+              '        print("New %s key pair generated for", name)' % SIGNATURES[sig].split(" signature")[0],
+              '        step("public key of " + name, public_part(USER_KEYS[name]))',
+              "    return USER_KEYS[name]", "", "",
+              "def sign_as(name, message):",
+              "    return sign_with(keys_of(name, create=True), message)", "", "",
+              "def verify_as(name, signature, message, show=False):",
+              "    keys = keys_of(name)",
+              "    if keys is None:",
+              "        if show:",
+              '            step("no key pair known for", name)',
+              "        return False",
+              "    if show:",
+              '        step("public key of " + name, public_part(keys))',
+              "    return verify_with(keys, signature, message, show)", "", "",
+              "def current_signer():"]
+        if login:
+            z += ['    """The logged-in user signs with their own key."""', "    return CURRENT_USER", "", ""]
         else:
-            z += ['    r, s = map(int, signature.split(","))', "    if show:", '        step("DSA signature (r, s)", (r, s))',
-                  '    return dh_verify(message, r, s, K["ds_p"], K["ds_q"], K["ds_g"], K["ds_y"])']
-        z += ["", ""]
+            z += ["    while True:",
+                  '        name = ask_text("Your name (your own key signs): ")',
+                  '        if ":" not in name and ";" not in name:',
+                  "            return name",
+                  "        print(\"A name must not contain ':' or ';'.\")", "", ""]
 
     if any(op["scheme"] == "p" and op["type"] != "votes" for op in ops):
         z += ["def he_encrypt_add(x):",
@@ -1045,17 +1287,22 @@ def build_records(cfg):
     z += ["# ==================== EDIT ZONE 2: what is hashed and signed ====================", ""]
     z += ["def hashed_part(rec):",
           '    """Everything except hash and signature -> changing ANY stored value is detected."""',
-          '    return "|".join(rec[name] for name in FIELDS if name not in ("hash", "sig"))', "", ""]
+          '    return "|".join(rec[name] for name in FIELDS if name not in %s)'
+          % ('("hash", "sig", "cosigs")' if cosign else '("hash", "sig")'), "", ""]
     if cfg["hash_over"] == "plaintext":
         z += ["def recompute_hash(rec, show=False):",
               '    """The hash is of the PLAINTEXT, so the receiver decrypts and hashes again."""',
-              "    return hash_fn(decrypt_data(rec, show))", "", ""]
+              "    return hash_fn(%s(rec, show))" % ("decrypt_all" if fenc else "decrypt_data"), "", ""]
     else:
         z += ["def recompute_hash(rec, show=False):", "    data = hashed_part(rec)", "    if show:",
               '        step("data hashed (id|ciphertexts|time)", data)', "    return hash_fn(data)", "", ""]
     if sig != "none":
         z += ["def signed_part(rec):", '    """The signature covers the hash AND the timestamp (trusted timestamp)."""',
               '    return rec["hash"] + "|" + rec["time"]', "", ""]
+    if cosign:
+        z += ["def cosign_message(rec):",
+              '    """A countersignature covers the first signature too -- hashed, so it fits any signature scheme."""',
+              '    return hash_fn(signed_part(rec) + "|" + rec["sig"])', "", ""]
     z += ["def check_record(rec, show=False):",
           '    """{check name: True/False} -- never raises. show=True prints every value compared."""',
           "    result = {}",
@@ -1069,7 +1316,28 @@ def build_records(cfg):
           '        show_value("hash received (sender)", rec["hash"])',
           '        show_value("hash recomputed (now)", recomputed)',
           '        show_value("hashes match", result["hash"])']
-    if sig != "none":
+    if sig != "none" and user_keys:
+        z += ["    try:",
+              "        if show:",
+              '            step("signature received (signed by " + rec["signer"] + ")", rec["sig"])',
+              '            step("message it must cover (hash|time)", signed_part(rec))',
+              '        result["signature"] = verify_as(rec["signer"], rec["sig"], signed_part(rec), show)',
+              "    except Exception:",
+              '        result["signature"] = False',
+              "    if show:",
+              '        show_value("signed by", rec["signer"])',
+              '        show_value("signature valid", result["signature"])']
+        if cosign:
+            z += ['    for entry in [e for e in rec["cosigs"].split(";") if e]:',
+                  '        name, signature = entry.split(":", 1)',
+                  "        try:",
+                  '            ok = verify_as(name, signature, cosign_message(rec), show)',
+                  "        except Exception:",
+                  "            ok = False",
+                  '        result["countersignature " + name] = ok',
+                  "        if show:",
+                  '            show_value("countersigned by " + name, ok)']
+    elif sig != "none":
         z += ["    try:",
               "        if show:",
               '            step("signature received", rec["sig"])',
@@ -1324,7 +1592,7 @@ def build_records(cfg):
                                 return f.read()
                     print("Cannot find", path)
         '''))
-    if cfg["window"] or "search_time" in cfg["used"]:
+    if cfg["window"] or cfg["decrypt_window"] or "search_time" in cfg["used"]:
         helpers.append(block(r'''
             def ask_time(prompt, default=None):
                 while True:
@@ -1422,7 +1690,11 @@ def build_records(cfg):
             a.append("    %s = ask_choice(%s, CHOICES)" % (f["var"], q(f["label"])))
         else:
             a.append("    %s = ask_file(%s)" % (f["var"], q("File with the " + f["label"].lower() + ": ")))
-    if len(fields) == 1 and fields[0]["kind"] == "file":
+    if fenc and not main_fields:
+        a.append('    plaintext = "(every field is encrypted separately)"')
+    elif fenc:
+        a.append("    plaintext = " + ' + "\\n" + '.join("%s + %s" % (q(f["label"] + ": "), as_text(f)) for f in main_fields))
+    elif len(fields) == 1 and fields[0]["kind"] == "file":
         a.append("    plaintext = " + fields[0]["var"])
     else:
         a.append("    plaintext = " + ' + "\\n" + '.join("%s + %s" % (q(f["label"] + ": "), as_text(f)) for f in fields))
@@ -1430,6 +1702,12 @@ def build_records(cfg):
         a.append("    extra = ask_text(%s)" % q(cfg["extra"]["label"] + ": "))
     a += ["", '    section("encrypting " + rec_id)', '    step("plaintext", plaintext)',
           '    rec = {"id": rec_id}', "    rec.update(encrypt_data(plaintext))"]
+    for f in fenc:
+        a.append('    rec["f_%s"] = encrypt_field_%s(%s)' % (f["var"], f["var"], as_text(field_by_label(cfg, f["label"]))))
+    if fenc and cfg["hash_over"] == "plaintext":
+        parts = ["plaintext"]
+        parts += ["%s + %s" % (q(f["label"] + ": "), as_text(field_by_label(cfg, f["label"]))) for f in fenc]
+        a.append("    full_plaintext = " + ' + "\\n" + '.join(parts))
     if cfg["extra"]:
         a.append('    rec["extra"] = encrypt_extra(extra)')
     done = set()
@@ -1453,13 +1731,23 @@ def build_records(cfg):
             a += ['    rec["%s"] = he_encrypt_add(%s)' % (op["store"], op["var"]),
                   '    step("Paillier Enc(%s) = g^m * r^n mod n^2", rec["%s"])' % (op["label"], op["store"])]
     a += ['    rec["time"] = timestamp()', '    step("timestamp", rec["time"])']
+    if user_keys:
+        a += ['    rec["signer"] = current_signer()', '    step("signer", rec["signer"])']
     hname = HASHES[cfg["hash"]]
-    if cfg["hash_over"] == "plaintext":
+    if cfg["hash_over"] == "plaintext" and fenc:
+        a += ['    step("data hashed (the plaintext)", full_plaintext)', '    rec["hash"] = hash_fn(full_plaintext)']
+    elif cfg["hash_over"] == "plaintext":
         a += ['    step("data hashed (the plaintext)", plaintext)', '    rec["hash"] = hash_fn(plaintext)']
     else:
         a += ['    step("data hashed (id|ciphertexts|time)", hashed_part(rec))', '    rec["hash"] = hash_fn(hashed_part(rec))']
     a.append('    step("%s hash", rec["hash"])' % hname)
-    if sig != "none":
+    if sig != "none" and user_keys:
+        a += ['    step("message signed (hash|time)", signed_part(rec))',
+              '    rec["sig"] = sign_as(rec["signer"], signed_part(rec))',
+              '    step("%s by " + rec["signer"] + " (their own key)", rec["sig"])' % SIGNATURES[sig]]
+        if cosign:
+            a.append('    rec["cosigs"] = ""                  # countersignatures are added later')
+    elif sig != "none":
         a += ['    step("message signed (hash|time)", signed_part(rec))',
               '    rec["sig"] = sign(signed_part(rec))',
               '    step("%s", rec["sig"])' % SIGNATURES[sig]]
@@ -1523,10 +1811,18 @@ def build_records(cfg):
              "    if not all(result.values()):",
              '        print("Verification FAILED -- refusing to decrypt.")',
              '        log_access("decrypt", rec["id"], "DENIED")',
-             "        return None",
-             '    section("decrypting " + rec["id"])',
+             "        return None"]
+        if dwin:
+            d += ['    now = datetime.now().strftime("%Y-%m-%d %H:%M")',
+                  '    show_value("decryption allowed", K["dstart"] + " .. " + K["dend"])',
+                  '    show_value("time now", now)',
+                  '    if not K["dstart"] <= now <= K["dend"]:',
+                  '        print("Outside the %s -- decryption refused.")' % dwin,
+                  '        log_access("decrypt", rec["id"], "DENIED (outside %s)")' % dwin,
+                  "        return None"]
+        d += ['    section("decrypting " + rec["id"])',
              "    try:",
-             "        plaintext = decrypt_data(rec, show=True)",
+             "        plaintext = %s(rec, show=True)" % ("decrypt_all" if fenc else "decrypt_data"),
              "    except Exception as e:",
              '        print("Decryption failed (wrong key?):", type(e).__name__, e)',
              '        log_access("decrypt", rec["id"], "FAILED")',
@@ -1645,6 +1941,211 @@ def build_records(cfg):
               '    log_access("search", ",".join(found) or "-", start + " .. " + end)',
               "    return found"]
         acts.append("\n".join(t))
+    if "cosign" in cfg["used"]:
+        acts.append(block(r'''
+            def cosign_record():
+                """A second user signs hash|time|first signature with THEIR OWN key."""
+                rec_id = ask_text(ID_LABEL + " to countersign: ")
+                records = load_records()
+                rec = next((r for r in records if r["id"] == rec_id), None)
+                if rec is None:
+                    print("Not found.")
+                    return None
+                section("verifying " + rec_id + " before countersigning")
+                result = check_record(rec, show=True)
+                if not all(result.values()):
+                    print("Verification FAILED -- refusing to countersign.")
+                    return None
+                name = current_signer()
+                already = [rec["signer"]] + [e.split(":", 1)[0] for e in rec["cosigs"].split(";") if e]
+                if name in already:
+                    print(name, "has already signed this record.")
+                    return None
+                message = cosign_message(rec)
+                step("message countersigned = hash of (hash|time|first signature)", message)
+                signature = sign_as(name, message)
+                step("countersignature by " + name, signature)
+                rec["cosigs"] = (rec["cosigs"] + ";" if rec["cosigs"] else "") + name + ":" + signature
+                save_records(records)
+                result_line(rec_id + " countersigned by " + name)
+                log_access("cosign", rec_id, name)
+                return True
+        '''))
+    if "show_keys" in cfg["used"]:
+        acts.append(block(r'''
+            def show_keys():
+                load_user_keys()
+                if not USER_KEYS:
+                    print("No signer has a key pair yet.")
+                for name, keys in USER_KEYS.items():
+                    section("public key of " + name)
+                    for number in public_part(keys):
+                        print("    " + wrap_value(number, 4))
+        '''))
+    if login:
+        acts.append(block(r'''
+            def hash_password(password, salt):
+                """Salted PBKDF2 -- only this is stored, never the password."""
+                return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100000).hex()
+
+
+            def load_users():
+                users = {}
+                if os.path.exists(USERS_FILE):
+                    with open(USERS_FILE, "r", encoding="utf-8") as f:
+                        for line in f:
+                            role, name, salt, stored = line.rstrip("\n").split("|")
+                            users[(role, name)] = (bytes.fromhex(salt), stored)
+                return users
+
+
+            def login(role):
+                """Returns the user name, or None. An unknown user may register (sets a password)."""
+                section(role + " login")
+                users = load_users()
+                name = ask_text("Username: ")
+                if (role, name) not in users:
+                    if ask_text("No " + role + " user called " + name + ". Register now? (y/n): ").lower() != "y":
+                        return None
+                    password = ask_text("Choose a password: ")
+                    salt = os.urandom(16)
+                    stored = hash_password(password, salt)
+                    step("salt", salt.hex())
+                    step("PBKDF2(password, salt) -- stored instead of the password", stored)
+                    with open(USERS_FILE, "a", encoding="utf-8") as f:
+                        f.write(role + "|" + name + "|" + salt.hex() + "|" + stored + "\n")
+                    print("Registered", name, "as", role)
+                    log_access("register", name, role)
+                    return name
+                salt, stored = users[(role, name)]
+                for attempt in range(3):
+                    computed = hash_password(ask_text("Password: "), salt)
+                    step("PBKDF2 of the typed password", computed)
+                    if hmac.compare_digest(computed, stored):
+                        print("Login OK:", name, "as", role)
+                        log_access("login", name, "OK")
+                        return name
+                    print("Wrong password.")
+                print("Too many wrong passwords.")
+                log_access("login", name, "FAILED")
+                return None
+        '''))
+    if sockets:
+        decrypt_call = ("decrypt_all" if fenc else "decrypt_data") \
+            if cfg["key_src"] not in ("typed_each", "password") else None
+        if decrypt_call:
+            server_decrypt = ("\n    plaintext = %s(rec, show=True)"
+                              "\n    section(\"decrypted on the server\")"
+                              "\n    for line in plaintext.split(\"\\n\"):"
+                              "\n        print(\"    \" + line)") % decrypt_call
+        else:
+            server_decrypt = "\n    print(\"(the key is typed by the user, so the server only verifies and stores)\")"
+        acts.append(block(r'''
+            # ---------- socket mode:  python THIS_FILE server   /   python THIS_FILE client ----------
+
+            def receive_line(conn):
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                return data.decode().rstrip("\n")
+
+
+            def handle_incoming(line):
+                """Server side: verify a received record, store it only if every check passes."""
+                section("record received")
+                parts = line.split("|")
+                if len(parts) != len(FIELDS):
+                    return "REJECTED: malformed record"
+                rec = dict(zip(FIELDS, parts))
+                result = check_record(rec, show=True)
+                show_value("RESULT", checks_text(result) + "  ->  " + status_of(result))
+                if not all(result.values()):
+                    log_access("receive", rec["id"], "REJECTED")
+                    return "REJECTED (tampered / not authentic): " + checks_text(result)
+                if find_record(rec["id"]) is not None:
+                    return "REJECTED: duplicate ID " + rec["id"]
+                append_record(rec){{decrypt}}
+                log_access("receive", rec["id"], "ACCEPTED")
+                return "ACK: " + rec["id"] + " verified and stored"
+
+
+            def server_loop(max_connections=None, ready=None):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    server.bind((HOST, PORT))
+                    server.listen()
+                    print("Server listening on", HOST, PORT, "(Ctrl+C to stop)")
+                    if ready is not None:
+                        ready.set()
+                    handled = 0
+                    while max_connections is None or handled < max_connections:
+                        conn, address = server.accept()
+                        with conn:
+                            reply = handle_incoming(receive_line(conn))
+                            conn.sendall((reply + "\n").encode())
+                        show_value("replied", reply)
+                        handled += 1
+
+
+            def send_record(rec):
+                """Client side: one record per connection, one reply line back."""
+                line = "|".join(rec[name] for name in FIELDS)
+                step("sending", line)
+                with socket.create_connection((HOST, PORT)) as client:
+                    client.sendall((line + "\n").encode())
+                    reply = receive_line(client)
+                show_value("server replied", reply)
+                return reply
+
+
+            def client_send_new():
+                before = len(load_records())
+                add_record()
+                records = load_records()
+                if len(records) > before:
+                    return send_record(records[-1])
+                return None
+
+
+            def client_send_tampered():
+                records = load_records()
+                if not records:
+                    print("Create and send a record first.")
+                    return None
+                rec = dict(records[-1])
+                rec["enc"] = rec["enc"][:-1] + ("0" if rec["enc"][-1] != "0" else "1")
+                print("Sending a copy of", rec["id"], "with one ciphertext character changed.")
+                return send_record(rec)
+
+
+            def server_main():
+                global ROLE
+                ROLE = "server"
+                setup_keys()
+                server_loop()
+
+
+            def client_main():
+                global ROLE
+                # the client keeps its OWN copy of every data file (same folder as the server)
+                for name in [n for n in globals() if n.endswith("_FILE") and n not in ("KEYS_FILE", "WRAPPED_KEY_FILE",
+                                                                                         "USERS_FILE", "SIGNER_KEYS_FILE")]:
+                    globals()[name] = globals()[name].replace(".txt", "_client.txt")
+                ROLE = "client"
+                setup_keys(){{login}}
+                run_menu("CLIENT -> server " + HOST + ":" + str(PORT), [
+                    ("Create a new record and send it", client_send_new),
+                    ("Send a TAMPERED copy of the last record", client_send_tampered),
+                ], back_label="Exit")
+        ''').replace("{{decrypt}}", server_decrypt).replace("{{login}}", """
+    global CURRENT_USER
+    user = None
+    while user is None:
+        user = login("Client")
+    CURRENT_USER = user""" if login else ""))
     acts.append(block(r'''
         def tamper_record():
             """Demo only: change one character of a stored ciphertext."""
@@ -1665,7 +2166,8 @@ def build_records(cfg):
     labels = action_labels(cfg)
     fn = {"add": "add_record", "view": "view_all", "view_meta": "view_meta", "verify": "verify_all",
           "decrypt": "decrypt_one", "report": "compliance_report",
-          "search": "search_records", "search_time": "search_time_range"}
+          "search": "search_records", "search_time": "search_time_range",
+          "cosign": "cosign_record", "show_keys": "show_keys"}
     for op in ops:
         fn[op["action"]] = op["action"]
     data_files = ["RECORDS_FILE", "LOG_FILE"] + index_files
@@ -1676,11 +2178,14 @@ def build_records(cfg):
          "    for path in (%s):" % ", ".join(data_files),
          "        if os.path.exists(path):",
          "            os.remove(path)", "", "",
-         "def main():", "    global ROLE", "    setup_keys()"]
+         "def main():", "    global ROLE" + (", CURRENT_USER" if login else ""), "    setup_keys()"]
     if not persist:
         m.append("    clear_files()")
     if cfg["roles"][0][0] is None:
         m.append('    ROLE = "user"')
+        if login:
+            m += ["    user = None", "    while user is None:", '        user = login("user")',
+                  "    CURRENT_USER = user", '    ROLE = "user (" + user + ")"']
         m.append("    run_menu(%s, [" % q(cfg["name"].upper()))
         for a_ in cfg["roles"][0][1]:
             m.append("        (%s, %s)," % (q(labels[a_]), fn[a_]))
@@ -1699,6 +2204,9 @@ def build_records(cfg):
         for i, (role, actions) in enumerate(roles, start=1):
             m.append('        %s choice == "%d":' % ("if" if i == 1 else "elif", i))
             m.append("            ROLE = %s" % q(role))
+            if login:
+                m += ["            user = login(%s)" % q(role), "            if user is None:", "                continue",
+                      "            CURRENT_USER = user", '            ROLE = %s + " (" + user + ")"' % q(role)]
             m.append("            run_menu(%s, [" % q(role))
             for a_ in actions:
                 m.append("                (%s, %s)," % (q(labels[a_]), fn[a_]))
@@ -1709,13 +2217,26 @@ def build_records(cfg):
     prog.add("\n".join(m))
 
     prog.add(build_records_test(cfg), "import os")
-    prog.add(block('''
-        if __name__ == "__main__":
-            if len(sys.argv) > 1 and sys.argv[1] == "test":
-                self_test()
-            else:
-                main()
-    '''))
+    if sockets:
+        prog.add(block('''
+            if __name__ == "__main__":
+                if len(sys.argv) > 1 and sys.argv[1] == "test":
+                    self_test()
+                elif len(sys.argv) > 1 and sys.argv[1] == "server":
+                    server_main()
+                elif len(sys.argv) > 1 and sys.argv[1] == "client":
+                    client_main()
+                else:
+                    main()
+        '''))
+    else:
+        prog.add(block('''
+            if __name__ == "__main__":
+                if len(sys.argv) > 1 and sys.argv[1] == "test":
+                    self_test()
+                else:
+                    main()
+        '''))
     return prog.render("\n".join(header))
 
 
@@ -1741,6 +2262,12 @@ def build_records_test(cfg):
         samples.append(row)
     ids = ["R1", "R2", "R3"]
     key_answer = [q("examkey123")] if cfg["key_src"] == "typed_each" else []
+    signers = ["Alice", "Bob", "Alice"]
+
+    def key_for(i):
+        if cfg["key_src"] == "password":
+            return [q("pw-R%d" % (i + 1))]
+        return key_answer
 
     def add_answers(i):
         out = [q(ids[i])]
@@ -1748,9 +2275,11 @@ def build_records_test(cfg):
             out.append("sample_file" if f["kind"] == "file" else q(samples[i][f["var"]]))
         if cfg["extra"]:
             out.append(q("AUTH%d" % (i + 1)))
-        out += key_answer
+        out += key_for(i)
         if cfg["iv_src"] == "typed":
             out.append(q("initvector%d" % (i + 1)))
+        if cfg["user_keys"] and not cfg["login"]:
+            out.append(q(signers[i]))
         return out
 
     def query_answers(method, field_label, value):
@@ -1803,13 +2332,18 @@ def build_records_test(cfg):
         files.append("DECRYPTED_FILE")
     if "report" in used:
         files.append("REPORT_FILE")
+    if cfg["login"]:
+        files.append("USERS_FILE")
+    if cfg["user_keys"] and cfg["persist"]:
+        files.append("SIGNER_KEYS_FILE")
     if index_fields:
         files.append("PLAIN_INDEX_FILE")
     if "sse" in cfg["index_types"]:
         files.append("SSE_INDEX_FILE")
     if "pkse" in cfg["index_types"]:
         files.append("PKSE_INDEX_FILE")
-    t += ["    global " + ", ".join(files), "", "    tmp = tempfile.mkdtemp()"]
+    extra_globals = (["CURRENT_USER"] if cfg["login"] or cfg["user_keys"] else []) + (["PORT"] if cfg["sockets"] else [])
+    t += ["    global " + ", ".join(files + extra_globals), "", "    tmp = tempfile.mkdtemp()"]
     for name in files:
         t.append('    %s = os.path.join(tmp, "%s.txt")' % (name, name[:-5].lower()))
     if any(f["kind"] == "file" for f in fields):
@@ -1841,7 +2375,16 @@ def build_records_test(cfg):
         setup_answers.append(q("examkey123"))
     if cfg["window"]:
         setup_answers += [q(""), q("")]
+    if cfg["decrypt_window"]:
+        setup_answers += [q(""), q("")]
     t += ["    queue[:] = [%s]" % ", ".join(setup_answers), "    setup_keys()", ""]
+    if cfg["login"]:
+        t += ['    assert run(lambda: login("Tester"), "alice", "y", "pw-alice") == "alice"      # register',
+              '    assert run(lambda: login("Tester"), "alice", "no", "nope", "wrong") is None   # 3 wrong passwords',
+              '    assert run(lambda: login("Tester"), "alice", "pw-alice") == "alice"           # correct password',
+              '    assert run(lambda: login("Tester"), "zed", "n") is None                       # unknown, not registered',
+              '    assert "pw-alice" not in open(USERS_FILE, encoding="utf-8").read()            # never stored',
+              '    CURRENT_USER = "alice"', ""]
     for i in range(3):
         t.append("    run(add_record, %s)" % ", ".join(add_answers(i)))
     t += ["    run(add_record, %s)                       # duplicate ID is refused" % q(ids[0]),
@@ -1850,7 +2393,7 @@ def build_records_test(cfg):
     if cfg["persist"]:
         t += ["",
               "    # restart: keys come back from KEYS_FILE, old records must still verify",
-              "    K.clear()",
+              "    K.clear()"] + (["    USER_KEYS.clear()"] if cfg["user_keys"] else []) + [
               "    queue[:] = []",
               "    setup_keys()",
               "    assert all(is_valid(rec) for rec in load_records())",
@@ -1859,9 +2402,18 @@ def build_records_test(cfg):
         if a_ in used:
             t.append("    run(%s)" % call)
     if "decrypt" in used:
-        t.append("    assert run(decrypt_one, %s) is not None" % ", ".join([q(ids[0])] + key_answer))
+        t.append("    assert run(decrypt_one, %s) is not None" % ", ".join([q(ids[0])] + key_for(0)))
         if decrypted:
             t.append('    assert len(open(DECRYPTED_FILE, encoding="utf-8").read().splitlines()) == 1')
+        if cfg["key_src"] == "password":
+            t.append('    assert run(decrypt_one, "R1", "not-the-password") is None             # wrong password refused')
+        if cfg["decrypt_window"]:
+            t += ['    saved_end = K["dend"]',
+                  '    K["dend"] = "2000-01-01 00:00"                                       # window already over',
+                  '    assert run(decrypt_one, "R1") is None',
+                  '    K["dend"] = saved_end']
+        if decrypted and (cfg["key_src"] == "password" or cfg["decrypt_window"]):
+            t.append('    assert len(open(DECRYPTED_FILE, encoding="utf-8").read().splitlines()) == 1   # refusals not written')
     if "report" in used:
         t.append("    assert run(compliance_report) == 3")
 
@@ -1913,6 +2465,24 @@ def build_records_test(cfg):
             rows = [i for i in range(3) if samples[i][ff["var"]].lower() == v.lower()]
             t.append("    assert run(%s) == %s          # fixed filter %s via %s"
                      % (", ".join([op["action"], q(v)] + more), expected(op, rows), ff["label"], op["filter_method"]))
+    if "cosign" in used:
+        if cfg["login"]:
+            t += ['    CURRENT_USER = "carol"', '    assert run(cosign_record, "R1") is True',
+                  '    assert run(cosign_record, "R1") is None                         # carol cannot sign twice',
+                  '    CURRENT_USER = "alice"']
+            who = "carol"
+        else:
+            t += ['    assert run(cosign_record, "R1", "Bob") is True',
+                  '    assert run(cosign_record, "R1", "Alice") is None                # Alice already signed']
+            who = "Bob"
+        t += ['    assert is_valid(find_record("R1"))',
+              '    assert "countersignature %s" in check_record(find_record("R1"))' % who]
+    if "show_keys" in used:
+        t.append("    run(show_keys)")
+    if cfg["user_keys"]:
+        t += ['    forged = dict(find_record("R3"))',
+              '    forged["signer"] = "Bob" if forged["signer"] != "Bob" else "Alice"    # claim someone else signed',
+              '    assert not is_valid(forged)']
     t += ["",
           "    # tamper with R2: every check must now refuse it",
           '    run(tamper_record, "R2")',
@@ -1939,6 +2509,27 @@ def build_records_test(cfg):
                 rows_after = [0, 2]
             t.append("    assert run(%s) == %s                 # R2 no longer counted"
                      % (", ".join([op["action"]] + answers + extra(op)), expected(op, rows_after)))
+    if cfg["sockets"]:
+        t += ["",
+              "    # sockets: a server thread receives a good record, a tampered copy and a duplicate",
+              "    import threading",
+              "    good = find_record(\"R1\")",
+              "    bad = dict(good)",
+              '    bad["enc"] = bad["enc"][:-1] + ("0" if bad["enc"][-1] != "0" else "1")',
+              "    probe = socket.socket()",
+              "    probe.bind((HOST, 0))",
+              "    PORT = probe.getsockname()[1]",
+              "    probe.close()",
+              '    RECORDS_FILE = os.path.join(tmp, "server_records.txt")',
+              "    ready = threading.Event()",
+              "    server = threading.Thread(target=server_loop, args=(3, ready))",
+              "    server.start()",
+              "    ready.wait()",
+              '    assert send_record(good).startswith("ACK")',
+              '    assert send_record(bad).startswith("REJECTED")',
+              '    assert send_record(good).startswith("REJECTED")                # duplicate ID',
+              "    server.join()",
+              "    assert len(load_records()) == 1"]
     t += ["", '    print("\\nSELF-TEST PASSED")']
     return "\n".join(t)
 
@@ -2011,7 +2602,8 @@ def build_kx(cfg):
         def private_key(given):
             if given is not None:
                 return given, pow(G, given, P)
-            return dh_generate_keypair(P, G)
+            public, private = dh_generate_keypair(P, G)
+            return private, public
 
 
         def key_exchange():
@@ -2339,8 +2931,9 @@ def interview_records():
         cfg["key_src"] = pick("Where does the key come from?", [
             ("random", "random, generated by the program"),
             ("typed_once", "typed by the user once at start-up"),
-            ("typed_each", "typed by the user when encrypting AND when decrypting")], 1)
-        cfg["wrap"] = pick("Encrypt the key with RSA?", [
+            ("typed_each", "typed by the user when encrypting AND when decrypting"),
+            ("password", "a password the user sets for EACH record (PBKDF2; salt + check stored, never the password)")], 1)
+        cfg["wrap"] = "none" if cfg["key_src"] == "password" else pick("Encrypt the key with RSA?", [
             ("none", "no"),
             ("record", "yes -- a FRESH random key per record, RSA-encrypted and stored in the record (hybrid)"),
             ("file", "yes -- ONE key, RSA-encrypted and saved to its own file (receiver unwraps it)")], 1)
@@ -2352,11 +2945,22 @@ def interview_records():
         cfg["rsa_bits"] = ask_num("RSA key size", 2048)
     if cfg["enc"] == "elgamal":
         cfg["elgamal_given"] = ask_given("ElGamal parameters given in the question?")
+    if yes("Encrypt some fields with a DIFFERENT algorithm (e.g. Diagnosis with RSA)?"):
+        own = ask_fields("  which fields get their own algorithm", [f["label"] for f in fields])
+        cfg["field_enc"] = {}
+        for label in own:
+            cfg["field_enc"][label] = pick("  algorithm for %s:" % label, [
+                ("aes128", "AES-128"), ("aes192", "AES-192"), ("aes256", "AES-256"), ("des", "DES (CBC)"),
+                ("3des", "Triple DES"), ("rsa", "RSA (OAEP)"), ("elgamal", "ElGamal"), ("ecc", "ECC"),
+                ("rabin", "Rabin")], 6)
 
     cfg["hash"] = pick("Hash:", [("sha256", "SHA-256"), ("sha512", "SHA-512"), ("sha1", "SHA-1"), ("md5", "MD5")], 1)
     cfg["hash_over"] = pick("Hash of:", [("ciphertext", "the ciphertext (can be checked without decrypting)"),
                                          ("plaintext", "the plaintext (receiver decrypts, then re-hashes)")], 1)
     cfg["sig"] = pick("Digital signature (signs hash|timestamp):", [(k, v) for k, v in SIGNATURES.items()], 2)
+    if cfg["sig"] != "none" and yes("Does every user sign with their OWN key pair (record stores who signed)?"):
+        cfg["user_keys"] = True
+        cfg["cosign"] = yes("  add a 'Countersign' action (a second user signs too)?")
 
     if yes("A separate small value encrypted with ElGamal (e.g. an authorization code)?"):
         cfg["extra"] = {"label": ask("  its name", "Authorization code"),
@@ -2421,7 +3025,12 @@ def interview_records():
             roles.append([name, picked])
         cfg["roles"] = roles
 
-    cfg["persist"] = yes("Keep keys between runs (saved to a keys file on the first run, reused later)?", "y")
+    cfg["login"] = yes("Must users LOG IN (username + password) before using a role?")
+    if yes("Allow decryption only inside a time window (e.g. after the exam starts)?"):
+        cfg["decrypt_window"] = ask("  call it", "exam window")
+    cfg["sockets"] = yes("Also run as a socket server / client (python file.py server | client)?")
+    cfg["persist"] = True if cfg["sockets"] else yes(
+        "Keep keys between runs (saved to a keys file on the first run, reused later)?", "y")
     cfg["decrypted_file"] = yes("Append every decrypted record to a decrypted-records file (history)?", "y")
     cfg["access_log"] = yes("Keep an access log (who did what, when)?", "y")
     cfg["show_steps"] = yes("Print every calculation (keys, IV, ciphertexts, data hashed, hash, signature, "

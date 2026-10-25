@@ -2,7 +2,8 @@ from Crypto.Cipher import DES
 from Crypto.Util.Padding import pad, unpad
 
 
-def des_generate_key():
+def des_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     return "12345678"
 
 
@@ -23,7 +24,7 @@ def des_decrypt(key, ciphertext):
 
 
 if __name__ == "__main__":
-    key = des_generate_key()
+    key = des_demo_key()
     data = "Hello DES"
 
     encrypted = des_encrypt(key, data)

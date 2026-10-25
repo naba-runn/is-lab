@@ -9,7 +9,8 @@ import hashlib
 
 # ---- from ciphers/aes.py (verbatim) ----
 
-def aes_generate_key():
+def aes_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     return "1234567890123456"
 
 
@@ -18,6 +19,7 @@ def aes_encrypt(key, plaintext, iv=None):
     iv = iv or get_random_bytes(AES.block_size)
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     encrypted = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
 
     return (iv + encrypted).hex()
@@ -30,6 +32,7 @@ def aes_decrypt(key, ciphertext):
     iv, encrypted = raw[:AES.block_size], raw[AES.block_size:]
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     decrypted = unpad(cipher.decrypt(encrypted), AES.block_size)
 
     return decrypted.decode()
@@ -38,7 +41,10 @@ def aes_decrypt(key, ciphertext):
 # ---- from ciphers/rsa.py (verbatim) ----
 
 def rsa_generate_keys():
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
     public_key = private_key.public_key()
 
     numbers = private_key.private_numbers()
@@ -124,7 +130,7 @@ if __name__ == "__main__":
         content = f.read()
 
     # 2. Encrypt the file content using AES, store the encrypted msg in another file
-    aes_key = aes_generate_key()
+    aes_key = aes_demo_key()
     encrypted_content = aes_encrypt(aes_key, content)
 
     encrypted_file = "patient_record.enc"

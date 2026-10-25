@@ -51,7 +51,7 @@
 #     5. Copy the pipeline from system_parts/integrity_and_signature.py, and
 #        normalize_bytes / tamper_hex from ciphers/glue_snippets.py.
 #     6. encrypt -> sha256_hash(ciphertext) -> rsa_sign(hash)
-#        receiver: recompute the hash and compare; rsa_verify(sig) == hash;
+#        receiver: recompute the hash and compare; rsa_verify(hash, sig, e, n);
 #        only if both match -> aes_decrypt
 #        tamper: tamper_hex(ciphertext), rehash, show the comparison fails.
 #

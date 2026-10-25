@@ -1,3 +1,11 @@
+# DSA (Diffie-Hellman domain) digital signature -- SAME interface as every other *_signature.py:
+#
+#   dh_sign(message, p, q, g, x)              -> signature as a STRING "r,s"
+#   dh_verify(message, signature, p, q, g, y)  -> True / False
+#
+# The signature may be that string or the two numbers / a tuple read back from a
+# file -- verify converts it.
+
 # Diffie-Hellman is a key-exchange protocol, not a signature scheme -- it has
 # no "sign" operation. The standard way to get digital signatures out of the
 # same discrete-log / (p, q, g) domain parameters DH uses is DSA (the Digital
@@ -55,10 +63,11 @@ def dh_sign(message, p, q, g, x):
         if s != 0:
             break
 
-    return r, s
+    return str(r) + "," + str(s)
 
 
-def dh_verify(message, r, s, p, q, g, y):
+def dh_verify(message, signature, p, q, g, y):
+    r, s = _split_signature(signature)
     if not (0 < r < q and 0 < s < q):
         return False
 
@@ -72,15 +81,22 @@ def dh_verify(message, r, s, p, q, g, y):
     return v == r
 
 
+def _split_signature(signature):
+    """A signature is the string "a,b"; numbers or a tuple (e.g. read from a file) work too."""
+    if isinstance(signature, str):
+        first, second = signature.split(",")
+        return int(first), int(second)
+    return int(signature[0]), int(signature[1])
+
+
 if __name__ == "__main__":
     p, q, g = dh_generate_domain_parameters()
     y, x = dh_generate_keys(p, q, g)
 
     message = "Alice"
-    r, s = dh_sign(message, p, q, g, x)
+    signature = dh_sign(message, p, q, g, x)
 
     print("Message   :", message)
-    print("Signature :", (r, s))
-    print("Verified  :", dh_verify(message, r, s, p, q, g, y))
-
-    print("Tampered  :", dh_verify("Mallory", r, s, p, q, g, y))
+    print("Signature :", signature)
+    print("Verified  :", dh_verify(message, signature, p, q, g, y))
+    print("Tampered  :", dh_verify("Mallory", signature, p, q, g, y))

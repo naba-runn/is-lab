@@ -1,12 +1,17 @@
+import hashlib
 import socket
 
 HOST = "127.0.0.1"
 PORT = 65433
 
 
+def rsa_message_number(message, n):
+    """What is actually signed: SHA-256 of the message as a number, reduced mod n."""
+    return int.from_bytes(hashlib.sha256(message.encode()).digest(), "big") % n
+
+
 def rsa_sign(message, d, n):
-    m = int.from_bytes(message.encode(), "big")
-    return pow(m, d, n)
+    return str(pow(rsa_message_number(message, n), d, n))
 
 
 def start_server(d, n, host=HOST, port=PORT):

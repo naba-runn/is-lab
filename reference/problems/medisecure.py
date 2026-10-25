@@ -4,7 +4,7 @@ from datetime import datetime
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from Crypto.Random import get_random_bytes
-from cryptography.hazmat.primitives.asymmetric import rsa as rsa_lib
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 
 # ---------- helpers (not cipher logic, just glue) ----------
@@ -15,7 +15,8 @@ def timestamp():
 
 def normalize_bytes(text, length):
     """Turns any user-typed string into an exact-length key/IV by truncating
-    or zero-padding, so AES never rejects a 'wrong size' key."""
+    or zero-padding, so AES never rejects a 'wrong size' key. Use length=16
+    for AES-128 (or any cipher's IV), 24 for AES-192, 32 for AES-256."""
     raw = text.encode()[:length]
     return raw.ljust(length, b"\0")
 
@@ -31,6 +32,7 @@ def aes_encrypt(key, plaintext, iv=None):
     iv = iv or get_random_bytes(AES.block_size)
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     encrypted = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
 
     return (iv + encrypted).hex()
@@ -43,6 +45,7 @@ def aes_decrypt(key, ciphertext):
     iv, encrypted = raw[:AES.block_size], raw[AES.block_size:]
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     decrypted = unpad(cipher.decrypt(encrypted), AES.block_size)
 
     return decrypted.decode()
@@ -51,7 +54,10 @@ def aes_decrypt(key, ciphertext):
 # ---- from ciphers/rsa.py (verbatim) ----
 
 def rsa_generate_keys():
-    private_key = rsa_lib.generate_private_key(public_exponent=65537, key_size=2048)
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
     public_key = private_key.public_key()
 
     numbers = private_key.private_numbers()
@@ -64,19 +70,19 @@ def rsa_generate_keys():
 
 
 # ---- from ciphers/rsa_signature.py (verbatim) ----
-# Signs the hash's hex STRING directly (same as signing any other text
-# message) -- no separate "hash-signing" scheme needed.
+# rsa_sign(message, d, n) -> str;  rsa_verify(message, signature, e, n) -> True/False
+
+def rsa_message_number(message, n):
+    """What is actually signed: SHA-256 of the message as a number, reduced mod n."""
+    return int.from_bytes(hashlib.sha256(message.encode()).digest(), "big") % n
+
 
 def rsa_sign(message, d, n):
-    m = int.from_bytes(message.encode(), "big")
-    return pow(m, d, n)
+    return str(pow(rsa_message_number(message, n), d, n))
 
 
-def rsa_verify(signature, e, n):
-    m = pow(signature, e, n)
-    length = (m.bit_length() + 7) // 8
-
-    return m.to_bytes(length, "big").decode(errors="replace")
+def rsa_verify(message, signature, e, n):
+    return pow(int(signature), e, n) == rsa_message_number(message, n)
 
 
 # ---------- shared in-memory store ----------
@@ -149,7 +155,7 @@ def doctor_menu(n, e, aes_key):
                 continue
 
             integrity_ok = sha256_hex(record["encrypted"]) == record["hash"]
-            authenticity_ok = rsa_verify(record["signature"], e, n) == record["hash"]
+            authenticity_ok = rsa_verify(record["hash"], record["signature"], e, n)
 
             print(f"Integrity check   : {'PASSED' if integrity_ok else 'FAILED'}")
             print(f"Authenticity check: {'PASSED' if authenticity_ok else 'FAILED'}")
@@ -190,7 +196,7 @@ def auditor_menu(n, e):
             if not record:
                 print("No such record.")
                 continue
-            ok = rsa_verify(record["signature"], e, n) == record["hash"]
+            ok = rsa_verify(record["hash"], record["signature"], e, n)
             print("Signature valid:", ok)
 
         elif choice == "3":

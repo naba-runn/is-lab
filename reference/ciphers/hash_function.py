@@ -10,14 +10,14 @@ def custom_hash(data):
         hash_value ^= (hash_value >> 13)      # bitwise mixing
         hash_value &= 0xFFFFFFFF              # keep to 32 bits
 
-    return hash_value
+    return format(hash_value, "08x")      # hex string, like every hash in hashing.py
 
 
 if __name__ == "__main__":
     messages = ["Hello, World!", "Hello, World?", "Hello, World!!", "Information Security"]
 
     for message in messages:
-        print(f"custom_hash({message!r}) = {custom_hash(message):#010x}")
+        print(f"custom_hash({message!r}) = {custom_hash(message)}")
 
     print()
     print("Note: 'Hello, World!' and 'Hello, World?' differ by one character")

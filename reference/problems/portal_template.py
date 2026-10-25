@@ -41,12 +41,16 @@ KEYS_FILE = os.path.join(HERE, "keys.txt")
 
 # ---------- from ciphers/aes192.py ----------
 
-def aes192_generate_key():
+def aes192_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     # 48 hex chars = 24 bytes -> AES-192
     return "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
 
 
 def aes192_encrypt(key_hex, plaintext):
+    # bytes.fromhex() decodes the hex digits into 24 raw bytes.
+    # key_hex.encode() would instead treat the 48-character string as literal
+    # ASCII text -> 48 bytes -> not a valid AES key size at all (crashes).
     key = bytes.fromhex(key_hex)
 
     iv = get_random_bytes(AES.block_size)
@@ -124,18 +128,17 @@ def rsa_generate_keys():
     return private_key, public_key, n, e, d
 
 
+def rsa_message_number(message, n):
+    """What is actually signed: SHA-256 of the message as a number, reduced mod n."""
+    return int.from_bytes(hashlib.sha256(message.encode()).digest(), "big") % n
+
+
 def rsa_sign(message, d, n):
-    m = int.from_bytes(message.encode(), "big")
-    signature = pow(m, d, n)
-
-    return signature
+    return str(pow(rsa_message_number(message, n), d, n))
 
 
-def rsa_verify(signature, e, n):
-    m = pow(signature, e, n)
-    length = (m.bit_length() + 7) // 8
-
-    return m.to_bytes(length, "big").decode(errors="replace")
+def rsa_verify(message, signature, e, n):
+    return pow(int(signature), e, n) == rsa_message_number(message, n)
 
 
 # ---------- from ciphers/hashing.py ----------
@@ -157,7 +160,7 @@ def load_or_create_keys():
         print("First run: generating keys (a few seconds)...")
         p_n, p_g, p_lam, p_mu = paillier_generate_keys()
         _, _, r_n, r_e, r_d = rsa_generate_keys()
-        keys = {"aes": aes192_generate_key(),
+        keys = {"aes": aes192_demo_key(),
                 "p_n": p_n, "p_g": p_g, "p_lam": p_lam, "p_mu": p_mu,
                 "r_n": r_n, "r_e": r_e, "r_d": r_d}
         with open(KEYS_FILE, "w", encoding="utf-8") as f:
@@ -184,8 +187,8 @@ def enc_text(s):          return aes192_encrypt(K["aes"], s)
 def dec_text(c):          return aes192_decrypt(K["aes"], c)
 def enc_num(x):           return str(paillier_encrypt(K["p_n"], K["p_g"], x))
 def hash_fn(s):           return md5_hash(s)                    # or sha256_hash
-def sign(h):              return str(rsa_sign(h, K["r_d"], K["r_n"]))
-def verify_sig(sig, h):   return rsa_verify(int(sig), K["r_e"], K["r_n"]) == h
+def sign(h):              return rsa_sign(h, K["r_d"], K["r_n"])
+def verify_sig(sig, h):   return rsa_verify(h, sig, K["r_e"], K["r_n"])
 
 
 def add_encrypted(cipher_strings):

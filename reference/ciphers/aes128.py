@@ -3,7 +3,8 @@ from Crypto.Util.Padding import pad, unpad
 from Crypto.Random import get_random_bytes
 
 
-def aes128_generate_key():
+def aes128_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     # 32 hex chars = 16 bytes -> AES-128
     return "0123456789ABCDEF0123456789ABCDEF"
 
@@ -34,7 +35,7 @@ def aes128_decrypt(key_hex, ciphertext):
 
 
 if __name__ == "__main__":
-    key = aes128_generate_key()
+    key = aes128_demo_key()
     message = "Sensitive Information"
 
     ciphertext = aes128_encrypt(key, message)

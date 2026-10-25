@@ -6,20 +6,25 @@ from Crypto.Random import get_random_bytes
 
 # ---- from ciphers/des.py (verbatim) ----
 
-def des_generate_key():
+def des_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
     return "12345678"
 
 
 def des_encrypt(key, plaintext):
     cipher = DES.new(key.encode(), DES.MODE_ECB)
 
-    return cipher.encrypt(pad(plaintext.encode(), DES.block_size)).hex()
+    encrypted = cipher.encrypt(pad(plaintext.encode(), DES.block_size))
+
+    return encrypted.hex()
 
 
 def des_decrypt(key, ciphertext):
     cipher = DES.new(key.encode(), DES.MODE_ECB)
 
-    return unpad(cipher.decrypt(bytes.fromhex(ciphertext)), DES.block_size).decode()
+    decrypted = unpad(cipher.decrypt(bytes.fromhex(ciphertext)), DES.block_size)
+
+    return decrypted.decode()
 
 
 # ---- from ciphers/aes.py (verbatim) ----
@@ -27,8 +32,9 @@ def des_decrypt(key, ciphertext):
 # AES-256 mode. No AES-256-specific code is needed; it's the exact same
 # aes_encrypt/aes_decrypt used everywhere else in ciphers/.
 
-def aes_generate_key():
-    return "A" * 32
+def aes_demo_key():
+    # FIXED demo key, not random -- use the key given in the question
+    return "1234567890123456"
 
 
 def aes_encrypt(key, plaintext, iv=None):
@@ -36,6 +42,7 @@ def aes_encrypt(key, plaintext, iv=None):
     iv = iv or get_random_bytes(AES.block_size)
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     encrypted = cipher.encrypt(pad(plaintext.encode(), AES.block_size))
 
     return (iv + encrypted).hex()
@@ -48,6 +55,7 @@ def aes_decrypt(key, ciphertext):
     iv, encrypted = raw[:AES.block_size], raw[AES.block_size:]
 
     cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+
     decrypted = unpad(cipher.decrypt(encrypted), AES.block_size)
 
     return decrypted.decode()
@@ -65,8 +73,8 @@ def measure(fn, *args, repeats=10000):
 if __name__ == "__main__":
     message = "Performance Testing of Encryption Algorithms"
 
-    des_key = des_generate_key()
-    aes_key = aes_generate_key()   # 32 chars -> AES-256
+    des_key = des_demo_key()
+    aes_key = aes_demo_key()   # 32 chars -> AES-256
 
     des_ciphertext, des_encrypt_time = measure(des_encrypt, des_key, message)
     _, des_decrypt_time = measure(des_decrypt, des_key, des_ciphertext)

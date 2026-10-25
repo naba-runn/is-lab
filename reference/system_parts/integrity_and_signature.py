@@ -9,6 +9,8 @@
 # The cipher is passed in as a function, so any of them works:
 #   RSA :  encrypt_fn=lambda t: rsa_encrypt(public_key, t)
 #   AES :  encrypt_fn=lambda t: aes_encrypt(key, t, iv=iv)
+# and so is any signature: sign_fn(message) -> str, verify_fn(message, signature) -> bool
+#   ElGamal: verify_fn=lambda m, sig: elgamal_verify(m, sig, p, g, y)
 
 import hashlib
 from datetime import datetime
@@ -19,7 +21,10 @@ from cryptography.hazmat.primitives import hashes
 # ---- from ciphers/rsa.py (verbatim) ----
 
 def rsa_generate_keys():
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
     public_key = private_key.public_key()
 
     numbers = private_key.private_numbers()
@@ -59,18 +64,17 @@ def rsa_decrypt(private_key, ciphertext):
 
 # ---- from ciphers/rsa_signature.py (verbatim) ----
 
+def rsa_message_number(message, n):
+    """What is actually signed: SHA-256 of the message as a number, reduced mod n."""
+    return int.from_bytes(hashlib.sha256(message.encode()).digest(), "big") % n
+
+
 def rsa_sign(message, d, n):
-    m = int.from_bytes(message.encode(), "big")
-    signature = pow(m, d, n)
-
-    return signature
+    return str(pow(rsa_message_number(message, n), d, n))
 
 
-def rsa_verify(signature, e, n):
-    m = pow(signature, e, n)
-    length = (m.bit_length() + 7) // 8
-
-    return m.to_bytes(length, "big").decode(errors="replace")
+def rsa_verify(message, signature, e, n):
+    return pow(int(signature), e, n) == rsa_message_number(message, n)
 
 
 # ---- from ciphers/hashing.py (verbatim) ----
@@ -110,9 +114,10 @@ def store_record(plaintext, encrypt_fn, sign_fn):
 
 
 def verify_record(record, verify_fn):
-    """Checks only; returns (integrity_ok, authentic_ok)."""
+    """Checks only; returns (integrity_ok, authentic_ok).
+    verify_fn(message, signature) -> True / False, like every *_verify in ciphers/."""
     integrity_ok = sha256_hash(record["encrypted"]) == record["hash"]
-    authentic_ok = verify_fn(record["signature"]) == record["hash"]
+    authentic_ok = verify_fn(record["hash"], record["signature"])
 
     return integrity_ok, authentic_ok
 
@@ -137,7 +142,7 @@ if __name__ == "__main__":
     encrypt_fn = lambda text: rsa_encrypt(public_key, text)
     decrypt_fn = lambda text: rsa_decrypt(private_key, text)
     sign_fn = lambda text: rsa_sign(text, d, n)
-    verify_fn = lambda signature: rsa_verify(signature, e, n)
+    verify_fn = lambda message, signature: rsa_verify(message, signature, e, n)
 
     record = store_record("Alice|34|F|O+|Hypertension", encrypt_fn, sign_fn)
     print("stored at        :", record["timestamp"])

@@ -13,7 +13,7 @@ def dh_generate_keypair(p, g):
     private_key = getRandomRange(2, p - 1)
     public_key = pow(g, private_key, p)
 
-    return private_key, public_key
+    return public_key, private_key      # (public, private) like every generator
 
 
 def compute_shared_secret(their_public_key, my_private_key, p):
@@ -25,8 +25,8 @@ if __name__ == "__main__":
     print("Public Parameters (p, g) =", (p, g))
 
     t0 = time.perf_counter()
-    alice_private, alice_public = dh_generate_keypair(p, g)
-    bob_private, bob_public = dh_generate_keypair(p, g)
+    alice_public, alice_private = dh_generate_keypair(p, g)
+    bob_public, bob_private = dh_generate_keypair(p, g)
     keygen_time = time.perf_counter() - t0
 
     t0 = time.perf_counter()

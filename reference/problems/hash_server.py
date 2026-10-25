@@ -5,17 +5,18 @@ PORT = 65432
 
 
 def custom_hash(data):
-    """djb2-style hash: start at 5381, multiply by 33 and add each
-    character's ASCII value, with an XOR-shift mixing step, masked to
-    32 bits. See ciphers/hash_function.py for the standalone version."""
+    """djb2-style hash: start at 5381, and for each character multiply the
+    running hash by 33 and add the character's ASCII value. An XOR-shift step
+    mixes the bits further, and the result is masked back to 32 bits after
+    every character so it never grows unbounded."""
     hash_value = 5381
 
     for char in data:
         hash_value = (hash_value * 33) + ord(char)
-        hash_value ^= (hash_value >> 13)
-        hash_value &= 0xFFFFFFFF
+        hash_value ^= (hash_value >> 13)      # bitwise mixing
+        hash_value &= 0xFFFFFFFF              # keep to 32 bits
 
-    return hash_value
+    return format(hash_value, "08x")      # hex string, like every hash in hashing.py
 
 
 def start_server(host=HOST, port=PORT):
@@ -34,9 +35,9 @@ def start_server(host=HOST, port=PORT):
             print(f"[Server] Received: {message!r}")
 
             digest = custom_hash(message)
-            print(f"[Server] Computed hash: {digest:#010x}")
+            print(f"[Server] Computed hash: {digest}")
 
-            conn.sendall(str(digest).encode())
+            conn.sendall(digest.encode())
             print("[Server] Hash sent back to client")
 
 
