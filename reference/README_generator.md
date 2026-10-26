@@ -8,6 +8,78 @@ tested templates.
 
 ---
 
+## 0. Install (once per machine)
+
+Only two libraries are needed; everything else is built into Python.
+
+| Package | Imported as | Used for |
+|---|---|---|
+| `pycryptodome` | `Crypto` | AES, DES, 3DES, padding, random keys, primes (ElGamal, Paillier, Rabin, DH, Schnorr, DSA) |
+| `cryptography` | `cryptography` | RSA (OAEP), ECC, HKDF, saving keys |
+
+Python **3.8 or newer** is required.
+
+### Linux
+
+```bash
+python3 --version                                   # must be 3.8+
+python3 -m pip install pycryptodome cryptography
+# or, from the repo folder:
+python3 -m pip install -r requirements.txt
+```
+
+If you get `No module named pip`:
+
+```bash
+sudo apt install python3-pip          # Debian / Ubuntu
+sudo dnf install python3-pip          # Fedora
+```
+
+If you get `error: externally-managed-environment` (newer Ubuntu / Debian), use one of:
+
+```bash
+python3 -m pip install --user pycryptodome cryptography
+# or a virtual environment:
+python3 -m venv venv && source venv/bin/activate && pip install pycryptodome cryptography
+# last resort:
+python3 -m pip install --break-system-packages pycryptodome cryptography
+```
+
+### Windows (Command Prompt or PowerShell)
+
+```bat
+py --version
+py -m pip install pycryptodome cryptography
+:: or, from the repo folder:
+py -m pip install -r requirements.txt
+```
+
+If `py` is not found, try `python -m pip install pycryptodome cryptography`.
+If `pip` is not found: `py -m ensurepip --upgrade`, then run the install again.
+No admin rights? Add `--user`:  `py -m pip install --user pycryptodome cryptography`
+
+### PyCharm (any OS)
+
+Settings → Project → Python Interpreter → **+** → search `pycryptodome` → Install,
+then the same for `cryptography`. (Or run the command above in PyCharm's
+*Terminal* tab — it uses the project's interpreter.)
+
+### Check it worked
+
+```bash
+python3 -c "from Crypto.Cipher import AES; from cryptography.hazmat.primitives.asymmetric import rsa; print('OK')"
+```
+(on Windows use `py -c "..."`)
+
+> **Do not install `crypto` or `pycrypto`** — they also use the name `Crypto` and
+> break `pycryptodome`. If imports fail strangely:
+> `python3 -m pip uninstall crypto pycrypto` (Windows: `py -m pip uninstall crypto pycrypto`),
+> then install `pycryptodome` again.
+
+On Windows, use `py` (or `python`) wherever this guide says `python3`.
+
+---
+
 ## 1. Quick start
 
 ```bash
