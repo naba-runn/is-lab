@@ -28,6 +28,8 @@
 #       every signer has their OWN key pair, plus a "Countersign" action
 #       a decryption time window (decrypt only between two times)
 #       socket mode:  python <file> server  /  python <file> client
+#       field constraints (digits only, length, allowed values, email, phone,
+#         date, custom regex, number range) -- invalid input is asked again
 #   - runs every menu action by itself with:   python <file> test
 #   - marks the numbers/names you should copy from the question with  TODO
 #
@@ -265,7 +267,19 @@ DEFAULTS = {
     "cosign": False,              # adds a "Countersign" action: a second signature by another user
     "sockets": False,             # the same file also runs as  python file.py server / client
     "decrypt_window": None,       # label, e.g. "exam window" -> decryption only allowed inside it
+    "constraints": {},            # {field label or ID label: rule}, see FIELD_PATTERNS / check_rule below
 }
+
+# Field constraints (all optional; a rule is a dict):
+#   text   : "pattern" (letters | digits | alnum | email | phone | date | a custom regex),
+#            "min_len", "max_len", "allowed": [values], "examples": [valid values] (for custom regex)
+#   number : "min", "max"
+FIELD_PATTERNS = {"letters": ("[A-Za-z ]+", "letters only"),
+                  "digits": ("[0-9]+", "digits only"),
+                  "alnum": ("[A-Za-z0-9]+", "letters and digits only"),
+                  "email": (r"[^@\s]+@[^@\s]+\.[^@\s]+", "an email address like name@mail.com"),
+                  "phone": ("[0-9]{10}", "a 10-digit phone number"),
+                  "date": (r"[0-9]{4}-[0-9]{2}-[0-9]{2}", "a date YYYY-MM-DD")}
 
 
 def field_by_label(cfg, label):
@@ -303,6 +317,17 @@ def normalize(cfg):
         print("note: hash of the plaintext needs the key to verify -> key typed once at start instead")
         cfg["key_src"] = "typed_once"
 
+    # field constraints, keyed by the exact label (the ID counts as a field)
+    rules = {}
+    for label, rule in (cfg["constraints"] or {}).items():
+        if label.lower() == cfg["id_label"].lower():
+            rules[cfg["id_label"]] = dict(rule)
+        else:
+            f = field_by_label(cfg, label)
+            if f["kind"] in ("text", "int"):
+                rules[f["label"]] = dict(rule)
+    cfg["rules"] = rules
+
     # fields with their own algorithm
     cfg["fenc"] = []
     for label, alg in (cfg["field_enc"] or {}).items():
@@ -336,6 +361,18 @@ def normalize(cfg):
     if sum(op["type"] == "votes" for op in ops) > 1:
         sys.exit("generate.py: only one 'votes' operation is supported")
     cfg["he"] = ops
+    for f in cfg["fields"]:
+        rule = cfg["rules"].get(f["label"])
+        if rule is None:
+            continue
+        if f["kind"] == "int":
+            cfg["rules"][f["label"]] = {k: v for k, v in rule.items() if k in ("min", "max")}
+        elif f["kind"] == "text":
+            cfg["rules"][f["label"]] = {k: v for k, v in rule.items() if k not in ("min", "max")}
+        else:
+            del cfg["rules"][f["label"]]
+        if not cfg["rules"].get(f["label"], True):
+            del cfg["rules"][f["label"]]
     if not any(op["scheme"] == "p" for op in ops):
         cfg["trustees"] = 0
 
@@ -665,6 +702,9 @@ def build_records(cfg):
         header.append("# it back and recovers the key with the RSA private key.")
     if cfg["decrypted_file"] and "decrypt" in cfg["used"]:
         header.append("# Every successful decryption is appended to %s_decrypted.txt (history)." % prefix)
+    if cfg["rules"]:
+        header.append("# Field constraints (CONSTRAINTS): %s -- invalid input is asked again."
+                      % ", ".join(sorted(cfg["rules"])))
     if login:
         header.append("# Every role menu starts with a username + password login (salted PBKDF2 in %s_users.txt)." % prefix)
     if password:
@@ -728,6 +768,8 @@ def build_records(cfg):
         consts.append('CURRENT_USER = "-"  # the user logged in / signing')
     if sockets:
         consts += ['HOST = "127.0.0.1"', "PORT = 5000"]
+    if cfg["rules"]:
+        consts.append("CONSTRAINTS = %s      # CHANGE: the rules the question gives" % json.dumps(cfg["rules"]))
     consts += ['ROLE = "-"          # the role currently logged in (written to the access log)',
                "SHOW_STEPS = %s   # chosen in generate.py: print every value computed" % bool(cfg["show_steps"])]
     prog.add("\n".join(consts), "import os", "import sys")
@@ -1555,6 +1597,56 @@ def build_records(cfg):
                     return s
                 print("Must be non-empty and must not contain '|'.")
     ''')]
+    if cfg["rules"]:
+        prog.need("import re")
+        helpers.append(block(r'''
+            FIELD_PATTERNS = {{patterns}}
+
+
+            def rule_problem(field, value):
+                """None if value obeys CONSTRAINTS[field], otherwise the reason."""
+                rule = CONSTRAINTS[field]
+                if isinstance(value, int):
+                    if "min" in rule and value < rule["min"]:
+                        return "must be at least " + str(rule["min"])
+                    if "max" in rule and value > rule["max"]:
+                        return "must be at most " + str(rule["max"])
+                    return None
+                if "min_len" in rule and len(value) < rule["min_len"]:
+                    return "must have at least " + str(rule["min_len"]) + " characters"
+                if "max_len" in rule and len(value) > rule["max_len"]:
+                    return "must have at most " + str(rule["max_len"]) + " characters"
+                if "allowed" in rule and value.lower() not in [a.lower() for a in rule["allowed"]]:
+                    return "must be one of: " + ", ".join(rule["allowed"])
+                if "pattern" in rule:
+                    regex, meaning = FIELD_PATTERNS.get(rule["pattern"], (rule["pattern"], "in the format " + rule["pattern"]))
+                    if not re.fullmatch(regex, value):
+                        return "must be " + meaning
+                    if rule["pattern"] == "date":
+                        try:
+                            datetime.strptime(value, "%Y-%m-%d")
+                        except ValueError:
+                            return "is not a real date"
+                return None
+
+
+            def ask_checked(prompt, field, as_int=False):
+                """Asks again until the value obeys the field's constraints."""
+                while True:
+                    if as_int:
+                        text = input(prompt).strip()
+                        try:
+                            value = int(text)
+                        except ValueError:
+                            print("  INVALID " + field + ": must be a whole number")
+                            continue
+                    else:
+                        value = ask_text(prompt)
+                    problem = rule_problem(field, value)
+                    if problem is None:
+                        return value
+                    print("  INVALID " + field + ": " + problem)
+        ''').replace("{{patterns}}", json.dumps(FIELD_PATTERNS).replace("], ", "],\n                  ")))
     if any(f["kind"] == "int" for f in fields):
         helpers.append(block(r'''
             def ask_int(prompt, minimum=0):
@@ -1677,15 +1769,22 @@ def build_records(cfg):
     acts = ["# ==================== EDIT ZONE 3: menu actions ===================="]
 
     a = ["def add_record():",
-         "    rec_id = ask_text(%s)" % q(cfg["id_label"] + ": "),
+         ("    rec_id = ask_checked(%s, ID_LABEL)" % q(cfg["id_label"] + ": ") if cfg["id_label"] in cfg["rules"]
+          else "    rec_id = ask_text(%s)" % q(cfg["id_label"] + ": ")),
          "    if find_record(rec_id) is not None:",
          "        print(%s, rec_id, \"already exists -- not stored again.\")" % q(cfg["id_label"]),
          "        return"]
     for f in fields:
         if f["kind"] == "text":
-            a.append("    %s = ask_text(%s)" % (f["var"], q(f["label"] + ": ")))
+            if f["label"] in cfg["rules"]:
+                a.append("    %s = ask_checked(%s, %s)" % (f["var"], q(f["label"] + ": "), q(f["label"])))
+            else:
+                a.append("    %s = ask_text(%s)" % (f["var"], q(f["label"] + ": ")))
         elif f["kind"] == "int":
-            a.append("    %s = ask_int(%s)" % (f["var"], q(f["label"] + ": ")))
+            if f["label"] in cfg["rules"]:
+                a.append("    %s = ask_checked(%s, %s, as_int=True)" % (f["var"], q(f["label"] + ": "), q(f["label"])))
+            else:
+                a.append("    %s = ask_int(%s)" % (f["var"], q(f["label"] + ": ")))
         elif f["kind"] == "choice":
             a.append("    %s = ask_choice(%s, CHOICES)" % (f["var"], q(f["label"])))
         else:
@@ -2240,6 +2339,50 @@ def build_records(cfg):
     return prog.render("\n".join(header))
 
 
+def sample_value(rule, kind, i, default):
+    """A value that obeys the rule (i makes it differ between rows)."""
+    if kind == "int":
+        low, high = rule.get("min"), rule.get("max")
+        value = int(default)
+        if low is not None and value < low:
+            value = low + 10 * (i + 1)
+        if high is not None and value > high:
+            value = max(low if low is not None else 1, high - (2 - i))
+        return str(value)
+    if rule.get("examples"):
+        return rule["examples"][i % len(rule["examples"])]
+    if rule.get("allowed"):
+        return rule["allowed"][i % len(rule["allowed"])]
+    pattern = rule.get("pattern")
+    value = {"digits": str(1001 + i), "letters": re.sub(r"[^A-Za-z]", "", default).upper()[:3] + "ABC"[i],
+             "alnum": default, "email": "user%d@mail.com" % (i + 1), "phone": "98765432%02d" % (i + 1),
+             "date": "2026-01-%02d" % (i + 1)}.get(pattern, default)
+    if "min_len" in rule and len(value) < rule["min_len"]:
+        value = value[0] * (rule["min_len"] - len(value)) + value           # pad in front, keep the varying end
+    if "max_len" in rule and len(value) > rule["max_len"]:
+        value = value[-rule["max_len"]:]
+    return value
+
+
+def invalid_value(rule):
+    """A value the rule must reject (to show the re-ask), or None if unsure."""
+    if "min" in rule:
+        return str(rule["min"] - 1)
+    if "max" in rule:
+        return str(rule["max"] + 1)
+    if rule.get("allowed"):
+        return "not-a-valid-choice"
+    bad = {"digits": "abc", "letters": "123", "alnum": "a-b", "email": "not-an-email", "phone": "123",
+           "date": "2026-13-45"}.get(rule.get("pattern"))
+    if bad:
+        return bad
+    if rule.get("min_len", 0) > 1:
+        return "x"
+    if "max_len" in rule:
+        return "x" * (rule["max_len"] + 1)
+    return None
+
+
 def build_records_test(cfg):
     fields, ops, search = cfg["fields"], cfg["he"], cfg["search"]
     index_fields, methods, used = cfg["index_fields"], cfg["methods"], cfg["used"]
@@ -2261,6 +2404,17 @@ def build_records_test(cfg):
                 row[f["var"]] = letters + str(i % 2 + 1)        # rows 1 and 3 share a value (for filters)
         samples.append(row)
     ids = ["R1", "R2", "R3"]
+    rules = cfg["rules"]
+    for f in fields:
+        if f["label"] in rules:
+            for i in range(3):
+                samples[i][f["var"]] = sample_value(rules[f["label"]], f["kind"], i % 2 if f["kind"] == "text" else i,
+                                                    samples[i][f["var"]])
+    if cfg["id_label"] in rules:
+        ids = [sample_value(rules[cfg["id_label"]], "text", i, ids[i]) for i in range(3)]
+        if len(set(ids)) < 3:
+            sys.exit("generate.py: the %s rule allows fewer than 3 different IDs for the self-test -- add examples"
+                     % cfg["id_label"])
     key_answer = [q("examkey123")] if cfg["key_src"] == "typed_each" else []
     signers = ["Alice", "Bob", "Alice"]
 
@@ -2271,7 +2425,14 @@ def build_records_test(cfg):
 
     def add_answers(i):
         out = [q(ids[i])]
+        bad = invalid_value(rules[cfg["id_label"]]) if i == 0 and cfg["id_label"] in rules else None
+        if bad is not None:
+            out.insert(0, q(bad))                       # first a value the rule must reject
         for f in fields:
+            if i == 0 and f["label"] in rules:
+                bad = invalid_value(rules[f["label"]])
+                if bad is not None:
+                    out.append(q(bad))
             out.append("sample_file" if f["kind"] == "file" else q(samples[i][f["var"]]))
         if cfg["extra"]:
             out.append(q("AUTH%d" % (i + 1)))
@@ -2531,7 +2692,11 @@ def build_records_test(cfg):
               "    server.join()",
               "    assert len(load_records()) == 1"]
     t += ["", '    print("\\nSELF-TEST PASSED")']
-    return "\n".join(t)
+    text = "\n".join(t)
+    if ids != ["R1", "R2", "R3"]:                       # constrained IDs: use the valid sample IDs everywhere
+        for number in (1, 2, 3):
+            text = re.sub(r'(?<=["\s,\[])R%d(?=["\],])' % number, ids[number - 1], text)
+    return text
 
 
 # =============================================================================
@@ -2906,6 +3071,45 @@ def ask_fields(prompt, labels):
             return chosen
 
 
+def ask_constraints(id_label, fields):
+    labels = [id_label] + [f["label"] for f in fields if f["kind"] != "file"]
+    chosen = ask_fields("  which fields have constraints", labels)
+    kinds = {f["label"]: f["kind"] for f in fields}
+    rules = {}
+    for label in chosen:
+        rule = {}
+        if kinds.get(label) == "int":
+            print("  %s is a number:" % label)
+            low, high = ask("    minimum (Enter = none)", ""), ask("    maximum (Enter = none)", "")
+            if low.strip():
+                rule["min"] = int(low)
+            if high.strip():
+                rule["max"] = int(high)
+        else:
+            kind = pick("  rule for %s:" % label, [
+                ("any", "any characters (only a length limit)"), ("letters", "letters only"),
+                ("digits", "digits only"), ("alnum", "letters and digits only"), ("email", "email address"),
+                ("phone", "10-digit phone number"), ("date", "date YYYY-MM-DD"),
+                ("allowed", "one of a fixed list of values"), ("regex", "custom pattern (regex)")], 1)
+            if kind == "allowed":
+                rule["allowed"] = [v.strip() for v in ask("    allowed values, comma separated", "A, B, C").split(",") if v.strip()]
+            elif kind == "regex":
+                rule["pattern"] = ask("    regex the WHOLE value must match", "[A-Z]{2}[0-9]{4}")
+                rule["examples"] = [v.strip() for v in ask("    3 valid example values (for the self-test)",
+                                                           "AB1234, CD5678, EF9012").split(",") if v.strip()]
+            elif kind != "any":
+                rule["pattern"] = kind
+            if kind not in ("allowed", "date", "phone"):
+                low, high = ask("    minimum length (Enter = none)", ""), ask("    maximum length (Enter = none)", "")
+                if low.strip():
+                    rule["min_len"] = int(low)
+                if high.strip():
+                    rule["max_len"] = int(high)
+        if rule:
+            rules[label] = rule
+    return rules
+
+
 def ask_given(prompt):
     s = ask(prompt + " -- type p,g,x or Enter to generate", "")
     if not s:
@@ -2922,6 +3126,8 @@ def interview_records():
     print("OTHER data fields to encrypt, comma separated. Add :int for numbers, :file to read a .txt file.")
     cfg["fields"] = ask("  fields", "Name, Details")
     fields = parse_fields(cfg["fields"])
+    if yes("Any CONSTRAINTS on the fields (digits only, length, allowed values, number range...)?"):
+        cfg["constraints"] = ask_constraints(cfg["id_label"], fields)
 
     cfg["enc"] = pick("Encrypt the data with:", [("aes128", "AES-128"), ("aes192", "AES-192"), ("aes256", "AES-256"),
                                                 ("des", "DES (CBC, with IV)"), ("3des", "Triple DES"),
