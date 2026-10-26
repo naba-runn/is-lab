@@ -30,6 +30,8 @@
 #       socket mode:  python <file> server  /  python <file> client
 #       field constraints (digits only, length, allowed values, email, phone,
 #         date, custom regex, number range) -- invalid input is asked again
+#       inputs from a .txt file: an 'Import records' action (one record per
+#         line) and  python <file> --answers answers.txt  (no typing at all)
 #   - runs every menu action by itself with:   python <file> test
 #   - marks the numbers/names you should copy from the question with  TODO
 #
@@ -227,6 +229,7 @@ def action_labels(cfg):
         "search_time": "Search by time range",
         "cosign": "Countersign a " + noun + " (with YOUR own key)",
         "show_keys": "Show every user's public key",
+        "import": "Import " + noun + "s from a .txt file (no typing)",
     }
     for op in cfg["he"]:
         labels[op["action"]] = OPS[op["type"]][2] % op["label"] + {
@@ -268,6 +271,9 @@ DEFAULTS = {
     "sockets": False,             # the same file also runs as  python file.py server / client
     "decrypt_window": None,       # label, e.g. "exam window" -> decryption only allowed inside it
     "constraints": {},            # {field label or ID label: rule}, see FIELD_PATTERNS / check_rule below
+    "sign_time": True,            # sign hash|timestamp (True) or only the hash (False)
+    "file_input": False,          # inputs from a .txt file: "Import records" action + --answers run mode
+    "import_separator": ",",      # separator between the values on one line of the import file
 }
 
 # Field constraints (all optional; a rule is a dict):
@@ -402,7 +408,7 @@ def normalize(cfg):
 
     # which actions exist, which roles get them
     all_actions = BASE_ACTIONS + (["cosign"] if cfg["cosign"] else []) + (["show_keys"] if cfg["user_keys"] else []) \
-        + [op["action"] for op in ops]
+        + (["import"] if cfg["file_input"] else []) + [op["action"] for op in ops]
     if not search:
         all_actions = [a for a in all_actions if a not in ("search", "search_time")]
     elif not search["time"]:
@@ -418,6 +424,10 @@ def normalize(cfg):
 
     if cfg["roles"]:
         cfg["roles"] = [[name, expand(actions)] for name, actions in cfg["roles"]]
+        if cfg["file_input"] and not any("import" in actions for _, actions in cfg["roles"]):
+            for _, actions in cfg["roles"]:          # whoever adds records may also import them
+                if "add" in actions:
+                    actions.insert(actions.index("add") + 1, "import")
     else:
         cfg["roles"] = [[None, list(all_actions)]]
     cfg["used"] = set(a for _, actions in cfg["roles"] for a in actions) | {"add"}
@@ -609,6 +619,22 @@ def he_function(op):
     return "\n".join(lines)
 
 
+def import_columns(cfg):
+    """The values on one line of the import file, in the order add_record asks for them."""
+    cols = [cfg["id_label"]] + [f["label"] + (" (file path)" if f["kind"] == "file" else "") for f in cfg["fields"]]
+    if cfg["extra"]:
+        cols.append(cfg["extra"]["label"])
+    if cfg["key_src"] == "typed_each":
+        cols.append("Key")
+    if cfg["key_src"] == "password":
+        cols.append("Password")
+    if cfg["iv_src"] == "typed":
+        cols.append("IV")
+    if cfg["user_keys"] and not cfg["login"]:
+        cols.append("Signer")
+    return cols
+
+
 def build_records(cfg):
     cfg = normalize(cfg)
     prog = Program()
@@ -636,6 +662,7 @@ def build_records(cfg):
     prefix = to_var(os.path.splitext(os.path.basename(cfg["out"]))[0])
     fields = cfg["fields"]
     sig = cfg["sig"]
+    sig_msg = "hash|time" if cfg["sign_time"] else "hash"
 
     # ---------------- header ----------------
     stored = ["id", "enc"]
@@ -665,11 +692,11 @@ def build_records(cfg):
             "votes": "Paillier encryptions of a 0/1 per option (one-hot ballot)",
             "time": "timestamp YYYY-MM-DD HH:MM:SS",
             "hash": HASHES[cfg["hash"]] + " of the " + ("plaintext" if cfg["hash_over"] == "plaintext" else "id + ciphertexts + time"),
-            "sig": SIGNATURES[sig] + " of hash|time" + (" with the SIGNER's own key" if user_keys else ""),
+            "sig": SIGNATURES[sig] + " of " + sig_msg + (" with the SIGNER's own key" if user_keys else ""),
             "salt": "random salt for this record's password (PBKDF2)",
             "pwcheck": "check value of the password-derived key (the password is never stored)",
             "signer": "who signed (their own key pair verifies it)",
-            "cosigs": "countersignatures  name:signature;name:signature  (over a hash of hash|time|sig)"}
+            "cosigs": "countersignatures  name:signature;name:signature  (over a hash of the signed message|sig)"}
     for f in fenc:
         alg_name = SYMMETRIC[f["alg"]][0] if f["alg"] in SYMMETRIC else ASYMMETRIC[f["alg"]]
         desc["f_" + f["var"]] = alg_name + " of " + f["label"] + " (its own algorithm)"
@@ -702,6 +729,15 @@ def build_records(cfg):
         header.append("# it back and recovers the key with the RSA private key.")
     if cfg["decrypted_file"] and "decrypt" in cfg["used"]:
         header.append("# Every successful decryption is appended to %s_decrypted.txt (history)." % prefix)
+    if cfg["file_input"]:
+        sep = cfg["import_separator"]
+        header += ["# Inputs from a .txt file, no typing:",
+                   "#   - menu action 'Import ... from a .txt file': one record per line, values separated",
+                   "#     by '%s' in this order:  %s" % (sep, (" " + sep + " ").join(import_columns(cfg))),
+                   "#     (blank lines and lines starting with # are skipped)",
+                   "#   - python %s --answers answers.txt : every question is answered by the next"
+                   % os.path.basename(cfg["out"]),
+                   "#     line of the file; the keyboard takes over when it runs out."]
     if cfg["rules"]:
         header.append("# Field constraints (CONSTRAINTS): %s -- invalid input is asked again."
                       % ", ".join(sorted(cfg["rules"])))
@@ -770,6 +806,9 @@ def build_records(cfg):
         consts += ['HOST = "127.0.0.1"', "PORT = 5000"]
     if cfg["rules"]:
         consts.append("CONSTRAINTS = %s      # CHANGE: the rules the question gives" % json.dumps(cfg["rules"]))
+    if cfg["file_input"]:
+        consts.append("IMPORT_COLUMNS = %s" % json.dumps(import_columns(cfg)))
+        consts.append("IMPORT_SEPARATOR = %s      # CHANGE: separator used in the import file" % q(cfg["import_separator"]))
     consts += ['ROLE = "-"          # the role currently logged in (written to the access log)',
                "SHOW_STEPS = %s   # chosen in generate.py: print every value computed" % bool(cfg["show_steps"])]
     prog.add("\n".join(consts), "import os", "import sys")
@@ -1333,14 +1372,25 @@ def build_records(cfg):
           % ('("hash", "sig", "cosigs")' if cosign else '("hash", "sig")'), "", ""]
     if cfg["hash_over"] == "plaintext":
         z += ["def recompute_hash(rec, show=False):",
-              '    """The hash is of the PLAINTEXT, so the receiver decrypts and hashes again."""',
-              "    return hash_fn(%s(rec, show))" % ("decrypt_all" if fenc else "decrypt_data"), "", ""]
+              '    """The hash is of the PLAINTEXT, so the receiver decrypts and hashes again.',
+              '    The plaintext is NOT printed here -- only after every check has passed."""',
+              "    if show:",
+              '        step("recomputing the hash", "decrypting silently (plaintext shown only if every check passes)")',
+              "    return hash_fn(%s(rec, False))" % ("decrypt_all" if fenc else "decrypt_data"), "", ""]
     else:
         z += ["def recompute_hash(rec, show=False):", "    data = hashed_part(rec)", "    if show:",
               '        step("data hashed (id|ciphertexts|time)", data)', "    return hash_fn(data)", "", ""]
     if sig != "none":
-        z += ["def signed_part(rec):", '    """The signature covers the hash AND the timestamp (trusted timestamp)."""',
-              '    return rec["hash"] + "|" + rec["time"]', "", ""]
+        if cfg["sign_time"]:
+            z += ["def signed_part(rec):", '    """The signature covers the hash AND the timestamp (trusted timestamp)."""',
+                  '    return rec["hash"] + "|" + rec["time"]', "", ""]
+        else:
+            z += ["def signed_part(rec):",
+                  '    """Only the hash is signed.%s"""' % (
+                      " The timestamp is still protected: it is part of the hashed data." if cfg["hash_over"] != "plaintext"
+                      else " NOTE: the hash is of the plaintext, so the timestamp is NOT protected\n"
+                           "    by hash or signature -- return rec[\"hash\"] + \"|\" + rec[\"time\"] to sign it too."),
+                  '    return rec["hash"]', "", ""]
     if cosign:
         z += ["def cosign_message(rec):",
               '    """A countersignature covers the first signature too -- hashed, so it fits any signature scheme."""',
@@ -1362,7 +1412,7 @@ def build_records(cfg):
         z += ["    try:",
               "        if show:",
               '            step("signature received (signed by " + rec["signer"] + ")", rec["sig"])',
-              '            step("message it must cover (hash|time)", signed_part(rec))',
+              '            step("message it must cover (%s)", signed_part(rec))' % sig_msg,
               '        result["signature"] = verify_as(rec["signer"], rec["sig"], signed_part(rec), show)',
               "    except Exception:",
               '        result["signature"] = False',
@@ -1383,7 +1433,7 @@ def build_records(cfg):
         z += ["    try:",
               "        if show:",
               '            step("signature received", rec["sig"])',
-              '            step("message it must cover (hash|time)", signed_part(rec))',
+              '            step("message it must cover (%s)", signed_part(rec))' % sig_msg,
               '        result["signature"] = verify_sig(rec["sig"], signed_part(rec), show)',
               "    except Exception:",
               '        result["signature"] = False',
@@ -1841,13 +1891,13 @@ def build_records(cfg):
         a += ['    step("data hashed (id|ciphertexts|time)", hashed_part(rec))', '    rec["hash"] = hash_fn(hashed_part(rec))']
     a.append('    step("%s hash", rec["hash"])' % hname)
     if sig != "none" and user_keys:
-        a += ['    step("message signed (hash|time)", signed_part(rec))',
+        a += ['    step("message signed (%s)", signed_part(rec))' % sig_msg,
               '    rec["sig"] = sign_as(rec["signer"], signed_part(rec))',
               '    step("%s by " + rec["signer"] + " (their own key)", rec["sig"])' % SIGNATURES[sig]]
         if cosign:
             a.append('    rec["cosigs"] = ""                  # countersignatures are added later')
     elif sig != "none":
-        a += ['    step("message signed (hash|time)", signed_part(rec))',
+        a += ['    step("message signed (%s)", signed_part(rec))' % sig_msg,
               '    rec["sig"] = sign(signed_part(rec))',
               '    step("%s", rec["sig"])' % SIGNATURES[sig]]
     a.append("    append_record(rec)")
@@ -2043,7 +2093,7 @@ def build_records(cfg):
     if "cosign" in cfg["used"]:
         acts.append(block(r'''
             def cosign_record():
-                """A second user signs hash|time|first signature with THEIR OWN key."""
+                """A second user signs (signed message|first signature) with THEIR OWN key."""
                 rec_id = ask_text(ID_LABEL + " to countersign: ")
                 records = load_records()
                 rec = next((r for r in records if r["id"] == rec_id), None)
@@ -2061,7 +2111,7 @@ def build_records(cfg):
                     print(name, "has already signed this record.")
                     return None
                 message = cosign_message(rec)
-                step("message countersigned = hash of (hash|time|first signature)", message)
+                step("message countersigned = hash of (signed message|first signature)", message)
                 signature = sign_as(name, message)
                 step("countersignature by " + name, signature)
                 rec["cosigs"] = (rec["cosigs"] + ";" if rec["cosigs"] else "") + name + ":" + signature
@@ -2245,6 +2295,85 @@ def build_records(cfg):
     while user is None:
         user = login("Client")
     CURRENT_USER = user""" if login else ""))
+    if cfg["file_input"]:
+        prog.need("import builtins")
+        acts.append(block(r'''
+            # ---------- inputs from a .txt file ----------
+
+            def feed(fn, answers):
+                """Runs fn() with every input() answered from the list -- no keyboard.
+                Returns False if a value is rejected (the same question asked twice) or missing."""
+                queue = list(answers)
+                last = [None]
+                real_input = builtins.input
+
+                def scripted(prompt=""):
+                    if prompt == last[0]:
+                        raise ValueError("value rejected for " + prompt.strip(" :>"))
+                    if not queue:
+                        raise ValueError("not enough values")
+                    last[0] = prompt
+                    answer = queue.pop(0)
+                    print(prompt + answer)
+                    return answer
+
+                builtins.input = scripted
+                try:
+                    fn()
+                    return True
+                except ValueError as e:
+                    print("  REJECTED:", e)
+                    return False
+                finally:
+                    builtins.input = real_input
+
+
+            def import_records(path=None):
+                """Adds every record of a .txt file (one per line, IMPORT_COLUMNS order) without typing."""
+                print("Each line: " + (" " + IMPORT_SEPARATOR + " ").join(IMPORT_COLUMNS))
+                path = path or ask_text("Import file (.txt): ")
+                if not os.path.isfile(path) and os.path.isfile(os.path.join(HERE, path)):
+                    path = os.path.join(HERE, path)
+                if not os.path.isfile(path):
+                    print("Cannot find", path)
+                    return []
+                added = []
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                for number, line in enumerate(lines, start=1):
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    values = [v.strip() for v in line.split(IMPORT_SEPARATOR)]
+                    section("import line " + str(number))
+                    if len(values) != len(IMPORT_COLUMNS):
+                        print("  SKIPPED: expected", len(IMPORT_COLUMNS), "values, found", len(values))
+                        continue
+                    before = len(load_records())
+                    if feed(add_record, values) and len(load_records()) > before:
+                        added.append(values[0])
+                    elif len(load_records()) == before:
+                        print("  SKIPPED line", number)
+                result_line("imported " + str(len(added)) + " record(s): " + (", ".join(added) or "none"))
+                log_access("import", ",".join(added) or "-", os.path.basename(path))
+                return added
+
+
+            def run_from_file(path):
+                """python THIS_FILE --answers answers.txt : each question takes the next line of the file."""
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                real_input = builtins.input
+
+                def scripted(prompt=""):
+                    if lines:
+                        answer = lines.pop(0)
+                        print(prompt + answer)
+                        return answer
+                    return real_input(prompt)            # file used up -> keyboard
+
+                builtins.input = scripted
+                main()
+        '''))
     acts.append(block(r'''
         def tamper_record():
             """Demo only: change one character of a stored ciphertext."""
@@ -2266,7 +2395,7 @@ def build_records(cfg):
     fn = {"add": "add_record", "view": "view_all", "view_meta": "view_meta", "verify": "verify_all",
           "decrypt": "decrypt_one", "report": "compliance_report",
           "search": "search_records", "search_time": "search_time_range",
-          "cosign": "cosign_record", "show_keys": "show_keys"}
+          "cosign": "cosign_record", "show_keys": "show_keys", "import": "import_records"}
     for op in ops:
         fn[op["action"]] = op["action"]
     data_files = ["RECORDS_FILE", "LOG_FILE"] + index_files
@@ -2324,7 +2453,18 @@ def build_records(cfg):
                 elif len(sys.argv) > 1 and sys.argv[1] == "server":
                     server_main()
                 elif len(sys.argv) > 1 and sys.argv[1] == "client":
-                    client_main()
+                    client_main(){{answers}}
+                else:
+                    main()
+        ''').replace("{{answers}}", "" if not cfg["file_input"] else
+                     '\n    elif len(sys.argv) > 2 and sys.argv[1] == "--answers":\n        run_from_file(sys.argv[2])'))
+    elif cfg["file_input"]:
+        prog.add(block('''
+            if __name__ == "__main__":
+                if len(sys.argv) > 1 and sys.argv[1] == "test":
+                    self_test()
+                elif len(sys.argv) > 2 and sys.argv[1] == "--answers":
+                    run_from_file(sys.argv[2])
                 else:
                     main()
         '''))
@@ -2354,7 +2494,7 @@ def sample_value(rule, kind, i, default):
     if rule.get("allowed"):
         return rule["allowed"][i % len(rule["allowed"])]
     pattern = rule.get("pattern")
-    value = {"digits": str(1001 + i), "letters": re.sub(r"[^A-Za-z]", "", default).upper()[:3] + "ABC"[i],
+    value = {"digits": str(1001 + i), "letters": re.sub(r"[^A-Za-z]", "", default).upper()[:3] + "ABCDEFGHIJ"[i % 10],
              "alnum": default, "email": "user%d@mail.com" % (i + 1), "phone": "98765432%02d" % (i + 1),
              "date": "2026-01-%02d" % (i + 1)}.get(pattern, default)
     if "min_len" in rule and len(value) < rule["min_len"]:
@@ -2670,6 +2810,46 @@ def build_records_test(cfg):
                 rows_after = [0, 2]
             t.append("    assert run(%s) == %s                 # R2 no longer counted"
                      % (", ".join([op["action"]] + answers + extra(op)), expected(op, rows_after)))
+    if cfg["file_input"] and "import" in used:
+        new_id = sample_value(rules[cfg["id_label"]], "text", 4, "R9") if cfg["id_label"] in rules else "R9"
+        values = [q(new_id)]
+        for f in fields:
+            values.append("sample_file" if f["kind"] == "file" else q(samples[1][f["var"]]))
+        if cfg["extra"]:
+            values.append(q("AUTH9"))
+        if cfg["key_src"] == "typed_each":
+            values.append(q("examkey123"))
+        if cfg["key_src"] == "password":
+            values.append(q("pw-new"))
+        if cfg["iv_src"] == "typed":
+            values.append(q("initvector9"))
+        if cfg["user_keys"] and not cfg["login"]:
+            values.append(q("Alice"))
+        lines = ['"# a comment line is skipped"',
+                 "IMPORT_SEPARATOR.join([%s])" % ", ".join(values),                         # good
+                 "IMPORT_SEPARATOR.join([%s])" % ", ".join([q(ids[0])] + values[1:]),        # duplicate ID
+                 '"only" + IMPORT_SEPARATOR + "two"']                                          # wrong count
+        bad_field = None
+        for f in fields:
+            if f["label"] in rules and invalid_value(rules[f["label"]]) is not None:
+                bad_field = f
+                break
+        if bad_field is not None:
+            bad_values = list(values)
+            bad_values[0] = q(sample_value(rules[cfg["id_label"]], "text", 5, "R8")
+                              if cfg["id_label"] in rules else "R8")          # a fresh, valid ID
+            bad_values[1 + fields.index(bad_field)] = q(invalid_value(rules[bad_field["label"]]))
+            lines.append("IMPORT_SEPARATOR.join([%s])" % ", ".join(bad_values))              # breaks a rule
+        t += ["",
+              "    # import from a .txt file: 1 good line, a duplicate, a wrong count%s"
+              % (", a rule violation" if bad_field is not None else ""),
+              '    import_file = os.path.join(tmp, "import.txt")',
+              '    with open(import_file, "w", encoding="utf-8") as f:',
+              '        f.write("\\n".join([%s]) + "\\n")' % ", ".join(lines),
+              "    before = len(load_records())",
+              "    assert import_records(import_file) == [%s]" % q(new_id),
+              "    assert len(load_records()) == before + 1",
+              "    assert is_valid(find_record(%s))" % q(new_id)]
     if cfg["sockets"]:
         t += ["",
               "    # sockets: a server thread receives a good record, a tampered copy and a duplicate",
@@ -3163,7 +3343,9 @@ def interview_records():
     cfg["hash"] = pick("Hash:", [("sha256", "SHA-256"), ("sha512", "SHA-512"), ("sha1", "SHA-1"), ("md5", "MD5")], 1)
     cfg["hash_over"] = pick("Hash of:", [("ciphertext", "the ciphertext (can be checked without decrypting)"),
                                          ("plaintext", "the plaintext (receiver decrypts, then re-hashes)")], 1)
-    cfg["sig"] = pick("Digital signature (signs hash|timestamp):", [(k, v) for k, v in SIGNATURES.items()], 2)
+    cfg["sig"] = pick("Digital signature:", [(k, v) for k, v in SIGNATURES.items()], 2)
+    if cfg["sig"] != "none":
+        cfg["sign_time"] = yes("  sign the hash TOGETHER with the timestamp (hash|timestamp)? 'n' = only the hash", "n")
     if cfg["sig"] != "none" and yes("Does every user sign with their OWN key pair (record stores who signed)?"):
         cfg["user_keys"] = True
         cfg["cosign"] = yes("  add a 'Countersign' action (a second user signs too)?")
@@ -3239,6 +3421,9 @@ def interview_records():
         "Keep keys between runs (saved to a keys file on the first run, reused later)?", "y")
     cfg["decrypted_file"] = yes("Append every decrypted record to a decrypted-records file (history)?", "y")
     cfg["access_log"] = yes("Keep an access log (who did what, when)?", "y")
+    cfg["file_input"] = yes("Read inputs from a .txt file (bulk 'Import records' + --answers mode)?")
+    if cfg["file_input"]:
+        cfg["import_separator"] = ask("  separator between values on one line", ",")
     cfg["show_steps"] = yes("Print every calculation (keys, IV, ciphertexts, data hashed, hash, signature, "
                             "recomputed hash, encrypted totals)?", "y")
     cfg["out"] = ask("Output file", "exam_solution.py")

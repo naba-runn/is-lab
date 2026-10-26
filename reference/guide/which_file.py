@@ -10,6 +10,7 @@
 #  guide/         these notes
 #  templates/     the past exam questions as complete, tested programs --
 #                 copy one, edit the lines marked "CHANGE:"
+#  README_generator.md   step-by-step guide to generate.py (every question explained)
 #  generate.py    asks about the scenario, writes a full runnable solution
 #                 file + runs its self-test (python generate.py --list for the
 #                 sample questions: evoting, employee, securevault,
