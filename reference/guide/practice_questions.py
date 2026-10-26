@@ -1,6 +1,10 @@
 # =============================================================================
 #  PRACTICE QUESTIONS  (mid-sem / end-sem style, labs 1-8)
 # =============================================================================
+#  EVERY question below has a complete, tested program in
+#  templates/practice/qNN_<name>.py  (python qNN_<name>.py test).
+#  Q1-Q11 and Q13 are also generator presets: python generate.py --preset <name>
+#
 #  New scenarios in the style of the real papers (MediSecure, SecureVault,
 #  HealthSecure, Hospital, FieldTrack, E-voting) -- same building blocks,
 #  different mixes. Each one says how to build it with generate.py, or
@@ -222,9 +226,11 @@
 # -----------------------------------------------------------------------------
 # Q16 ClassicTrack -- chained classical ciphers                     (lab 1)
 # -----------------------------------------------------------------------------
-#  Encrypt "the house is being sold tonight" with Vigenere (key "dollars"),
-#  then Playfair (key "guidance"), then decrypt in reverse. Then brute-force
-#  an additive cipher ciphertext and find the key from a known word.
+#  Encrypt "the house is being sold tonight" with Playfair (key "guidance"),
+#  then Vigenere (key "dollars"), then decrypt in reverse. (Playfair first:
+#  it turns j into i and adds filler x's, so it cannot sit in the MIDDLE of a
+#  chain that must decrypt back exactly.) Then brute-force an additive cipher
+#  ciphertext and find the key from a known word.
 #
 #  GAP: not a generator shape. Today: ciphers/vigenere.py, playfair.py,
 #  problems/prac1.py (chaining), attacks/classical_attacks.py.

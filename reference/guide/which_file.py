@@ -23,6 +23,7 @@
 #   HealthSecure: RSA per field, SHA-256, RSA sig; Doctor/Nurse/Admin            templates/healthsecure.py
 #   Hospital: file -> AES-128, AES key RSA-encrypted in a file, ElGamal code     templates/hospital.py
 #   MediSecure: AES typed key + IV, SHA-256, RSA sig; Patient/Doctor/Auditor     templates/medisecure.py
+#   18 practice questions (guide/practice_questions.py) as programs             templates/practice/qNN_*.py
 #
 # --- ciphers/ ----------------------------------------------------------------
 #   Additive / multiplicative / affine cipher          ciphers/primitives.py

@@ -298,12 +298,16 @@ python generate.py --preset hospital --out hosp.py --no-test
 | `medisecure` | AES with typed key + IV, SHA-256, RSA signature; Patient / Doctor / Auditor |
 | `grant` | AES-192, Paillier sum of amounts, MD5, RSA signature, SSE search |
 | `fieldtrack` | Diffie-Hellman + affine with k1/k2 checks |
+| `pharmachain` `legaldocs` `insureclaim` `courtevidence` `payrollplus` `citypoll` `campusexam` `smartmeter` `bloodbank` `researchvault` `tenderbid` `cipherrelay` | the practice questions Q1–Q11 and Q13 from `guide/practice_questions.py` |
 
 Options: `--out file.py` (output name), `--no-test` (skip the self-test),
 `--force` (overwrite without asking).
 
 > Hand-written, shorter versions of the past exam questions are also in
 > `reference/templates/` — open one, edit the lines marked `CHANGE:`.
+> All 18 practice questions are complete programs in `reference/templates/practice/`
+> (Q12 and Q14–Q18 are hand-written: DH + Vigenère/Hill, key management, benchmarks,
+> classical chain, document search, hash lab).
 
 ---
 
