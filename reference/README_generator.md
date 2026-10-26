@@ -231,6 +231,11 @@ signature …).
 | Question | What to answer |
 |---|---|
 | Role-based (RBAC) menus? | `y`, then role names, then for each role the numbers of its actions from the printed list |
+
+**Verify vs decrypt:** *Verify all* and *Verify one* only check hash, signature and time — the
+record's contents are never shown. *Verify, then decrypt* checks first and shows the contents
+only if every check passes. Give "verify only" roles (Nurse, Auditor) just the verify actions.
+
 | Must users LOG IN? | `y` for username + password before a role (salted PBKDF2) |
 | Allow decryption only inside a time window? | `y` for "decrypt only after the exam starts" |
 | Also run as a socket server / client? | `y` for client/server questions |
@@ -240,8 +245,8 @@ Typical action choices per role:
 | Role style | Actions |
 |---|---|
 | creates data (Patient, Client, Voter, Sender) | Add, View, Import |
-| reads data (Doctor, Lawyer, Receiver) | Verify, Verify-then-decrypt |
-| checks only (Nurse, Auditor, Compliance) | Verify, Compliance report, View IDs/hashes/VALID |
+| reads data (Doctor, Lawyer, Receiver) | Verify-then-decrypt (shows the contents), Verify one |
+| checks only (Nurse, Auditor, Compliance) | Verify all, **Verify one (no decryption shown)**, Compliance report, View IDs/hashes/VALID |
 | statistics (Finance, Trustees) | the homomorphic actions |
 
 ### Files and output

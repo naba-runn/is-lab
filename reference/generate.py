@@ -185,7 +185,7 @@ HASHES = {"sha256": "SHA-256", "sha512": "SHA-512", "sha1": "SHA-1", "md5": "MD5
 SIGNATURES = {"none": "no signature", "rsa": "RSA signature", "elgamal": "ElGamal signature",
               "schnorr": "Schnorr signature", "dsa": "DSA signature"}
 
-BASE_ACTIONS = ["add", "view", "view_meta", "verify", "decrypt", "report", "search", "search_time"]
+BASE_ACTIONS = ["add", "view", "view_meta", "verify", "verify_one", "decrypt", "report", "search", "search_time"]
 # Every homomorphic operation the four lab-7 schemes support. scheme: p = Paillier,
 # m = textbook RSA, e = ElGamal (multiplicative), x = exponential ElGamal.
 # shape: agg = combine the chosen records into ONE result; map = a result per
@@ -223,6 +223,7 @@ def action_labels(cfg):
         "view": "View all stored " + noun + "s (encrypted)",
         "view_meta": "View IDs, timestamps, hashes and VALID/INVALID",
         "verify": "Verify all " + noun + "s (hash + signature)",
+        "verify_one": "Verify one " + noun + " (no decryption shown)",
         "decrypt": "Verify, then decrypt one " + noun,
         "report": "Generate compliance report (no decryption)",
         "search": "Search " + noun + "s (" + " / ".join(m if m != "plain" else "plain index" for m in cfg["methods"]) + ")",
@@ -1948,6 +1949,20 @@ def build_records(cfg):
                     show_value("RESULT", checks_text(result) + "  ->  " + status_of(result))
                     log_access("verify", rec["id"], status_of(result))
         '''))
+    if "verify_one" in cfg["used"]:
+        acts.append(block(r'''
+            def verify_one():
+                """Hash + signature (+ time) of ONE record. The record's contents are never shown."""
+                rec = find_record(ask_text(ID_LABEL + " to verify: "))
+                if rec is None:
+                    print("Not found.")
+                    return None
+                section("verifying " + rec["id"] + " (contents not shown)")
+                result = check_record(rec, show=True)
+                show_value("RESULT", checks_text(result) + "  ->  " + status_of(result))
+                log_access("verify", rec["id"], status_of(result))
+                return all(result.values())
+        '''))
     if "decrypt" in cfg["used"]:
         d = ["def decrypt_one():",
              "    rec = find_record(ask_text(%s))" % q(cfg["id_label"] + " to decrypt: "),
@@ -2393,7 +2408,7 @@ def build_records(cfg):
     # ---------------- main ----------------
     labels = action_labels(cfg)
     fn = {"add": "add_record", "view": "view_all", "view_meta": "view_meta", "verify": "verify_all",
-          "decrypt": "decrypt_one", "report": "compliance_report",
+          "decrypt": "decrypt_one", "report": "compliance_report", "verify_one": "verify_one",
           "search": "search_records", "search_time": "search_time_range",
           "cosign": "cosign_record", "show_keys": "show_keys", "import": "import_records"}
     for op in ops:
@@ -2699,6 +2714,8 @@ def build_records_test(cfg):
               "    setup_keys()",
               "    assert all(is_valid(rec) for rec in load_records())",
               ""]
+    if "verify_one" in used:
+        t.append("    assert run(verify_one, %s) is True" % q(ids[0]))
     for a_, call in (("view", "view_all"), ("view_meta", "view_meta"), ("verify", "verify_all")):
         if a_ in used:
             t.append("    run(%s)" % call)
@@ -2790,6 +2807,8 @@ def build_records_test(cfg):
           '    assert not is_valid(find_record("R2"))']
     if "verify" in used:
         t.append("    run(verify_all)")
+    if "verify_one" in used:
+        t.append('    assert run(verify_one, "R2") is False                  # tampered -> INVALID, nothing shown')
     if "decrypt" in used:
         t.append('    assert run(decrypt_one, "R2") is None')
         if decrypted:
